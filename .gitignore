@@ -5,6 +5,8 @@
 ledger.json
 monitor_state.json
 monitor.log
+watchlist.json
+equity_history.json
 
 # Google Drive (optional, not part of public tool)
 gdrive.py
@@ -28,3 +30,6 @@ plays/*.md
 
 # Claude memory (personal)
 .claude/
+
+# Media (personal content, reels, screenshots)
+media/

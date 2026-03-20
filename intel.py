@@ -4,14 +4,14 @@ import sys
 import time
 import httpx
 import feedparser
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # ============================================================
 # 1. MILITARY FLIGHT TRACKING (ADS-B)
 # ============================================================
 
 def get_military_flights_taiwan():
-    """Check for military aircraft near Taiwan Strait (21-27°N, 117-123°E)."""
+    """Check for military aircraft near Taiwan Strait (21-27N, 117-123E)."""
     try:
         # ADS-B Exchange — military aircraft near Taiwan
         # Bounding box: lat1,lat2,lon1,lon2
@@ -40,12 +40,12 @@ def get_military_flights_taiwan():
                         "speed": ac.get("gs", ""),
                     })
             return taiwan_mil
-    except Exception as e:
+    except (httpx.HTTPError, ValueError, KeyError) as e:
         return {"error": str(e)}
 
 
 def get_military_flights_hormuz():
-    """Check for military aircraft near Strait of Hormuz (24-28°N, 54-60°E)."""
+    """Check for military aircraft near Strait of Hormuz (24-28N, 54-60E)."""
     try:
         resp = httpx.get(
             "https://globe.adsbexchange.com/data/aircraft.json",
@@ -68,7 +68,7 @@ def get_military_flights_hormuz():
                         "lon": lon,
                     })
             return hormuz_mil
-    except Exception as e:
+    except (httpx.HTTPError, ValueError, KeyError) as e:
         return {"error": str(e)}
 
 
@@ -83,8 +83,8 @@ def get_hormuz_shipping():
         resp = httpx.get("https://hormuzstraitmonitor.com/api/vessels", timeout=10)
         if resp.status_code == 200:
             return resp.json()
-    except:
-        pass
+    except (httpx.HTTPError, ValueError, OSError):
+        pass  # Fall through to next source
 
     # Fallback: scrape summary data
     try:
@@ -95,8 +95,8 @@ def get_hormuz_shipping():
         )
         if resp.status_code == 200:
             return resp.json()
-    except:
-        pass
+    except (httpx.HTTPError, ValueError, OSError):
+        pass  # Both sources failed, return status message below
 
     return {"status": "No free AIS API available — use aisstream.io websocket for live data"}
 
@@ -109,7 +109,7 @@ def get_earthquakes(min_magnitude=5.0, days=7):
     """Get recent significant earthquakes worldwide."""
     try:
         end = datetime.now(timezone.utc)
-        start = datetime(end.year, end.month, max(1, end.day - days), tzinfo=timezone.utc)
+        start = end - timedelta(days=days)
         resp = httpx.get(
             "https://earthquake.usgs.gov/fdsnws/event/1/query",
             params={
@@ -135,7 +135,7 @@ def get_earthquakes(min_magnitude=5.0, days=7):
                 "lon": coords[0] if len(coords) > 0 else None,
             })
         return quakes
-    except Exception as e:
+    except (httpx.HTTPError, ValueError, KeyError, OSError) as e:
         return {"error": str(e)}
 
 
@@ -179,6 +179,7 @@ def scan_news(max_age_hours=6):
 
                 # Check age
                 published = entry.get("published_parsed")
+                age_hours = None
                 if published:
                     entry_time = time.mktime(published)
                     age_hours = (now - entry_time) / 3600
@@ -195,10 +196,10 @@ def scan_news(max_age_hours=6):
                             "category": category,
                             "keywords": matched,
                             "link": entry.get("link", ""),
-                            "age_hours": round(age_hours, 1) if published else None,
+                            "age_hours": round(age_hours, 1) if age_hours is not None else None,
                         })
-        except Exception as e:
-            pass
+        except (OSError, ValueError, KeyError, AttributeError) as e:
+            print(f"  Warning: Failed to fetch {feed_name}: {e}")
 
     # Deduplicate by title
     seen = set()
@@ -224,8 +225,8 @@ def get_oil_price():
         )
         if resp.status_code == 200:
             return resp.json()
-    except:
-        pass
+    except (httpx.HTTPError, ValueError, OSError):
+        pass  # Fall through to next source
 
     # Fallback: scrape from a free source
     try:
@@ -235,8 +236,8 @@ def get_oil_price():
         )
         if resp.status_code == 200:
             return resp.json()
-    except:
-        pass
+    except (httpx.HTTPError, ValueError, OSError):
+        pass  # Both sources failed
 
     return {"status": "Use web search for current oil price"}
 
@@ -254,9 +255,53 @@ def get_gold_price():
         )
         if resp.status_code == 200:
             return resp.json()
-    except:
-        pass
+    except (httpx.HTTPError, ValueError, OSError):
+        pass  # Source failed
     return {"status": "Use web search for current gold price"}
+
+
+# ============================================================
+# 7. CRYPTO PRICES (BTC, ETH)
+# ============================================================
+
+def get_crypto_prices():
+    """Get current BTC and ETH prices from CoinGecko (free, no API key)."""
+    try:
+        resp = httpx.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "bitcoin,ethereum", "vs_currencies": "usd", "include_24hr_change": "true"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            result = {}
+            for coin_id, info in data.items():
+                result[coin_id] = {
+                    "price": info.get("usd"),
+                    "change_24h_pct": info.get("usd_24h_change"),
+                }
+            return result
+    except (httpx.HTTPError, ValueError, OSError):
+        pass  # Fall through to status message
+    return {"status": "Use web search for crypto prices"}
+
+
+# ============================================================
+# 8. WEATHER / HURRICANE DATA (NHC)
+# ============================================================
+
+def get_active_hurricanes():
+    """Get active tropical cyclones from NHC (NOAA)."""
+    try:
+        resp = httpx.get(
+            "https://www.nhc.noaa.gov/CurrentSummaries.json",
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except (httpx.HTTPError, ValueError, OSError):
+        pass  # Fall through to status message
+    return {"status": "No active hurricane data available"}
 
 
 # ============================================================
@@ -266,7 +311,7 @@ def get_gold_price():
 def full_report():
     """Run all intelligence gathering and print a report."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    print(f"INTELLIGENCE REPORT — {now}")
+    print(f"INTELLIGENCE REPORT -- {now}")
     print("=" * 60)
 
     # News Alerts
@@ -293,7 +338,7 @@ def full_report():
     if isinstance(quakes, list):
         if quakes:
             for q in quakes[:10]:
-                print(f"  M{q['magnitude']} — {q['place']} ({q['time']})")
+                print(f"  M{q['magnitude']} -- {q['place']} ({q['time']})")
         else:
             print("  No significant earthquakes.")
     else:
@@ -322,6 +367,20 @@ def full_report():
     else:
         print("  Hormuz area: no aircraft detected")
 
+    # Crypto prices
+    print("\n\n[CRYPTO PRICES]")
+    print("-" * 40)
+    crypto = get_crypto_prices()
+    if isinstance(crypto, dict) and "error" not in crypto and "status" not in crypto:
+        for coin, info in crypto.items():
+            price = info.get("price")
+            change = info.get("change_24h_pct")
+            if price:
+                change_str = f"  ({change:+.1f}%)" if change else ""
+                print(f"  {coin.upper()}: ${price:,.2f}{change_str}")
+    else:
+        print(f"  Crypto prices: unavailable")
+
     # Summary
     print("\n\n[SIGNAL SUMMARY]")
     print("-" * 40)
@@ -330,14 +389,14 @@ def full_report():
     oil_alerts = sum(1 for a in alerts if a["category"] == "oil")
     uk_alerts = sum(1 for a in alerts if a["category"] == "uk_politics")
 
-    print(f"  China/Taiwan:  {china_alerts} news alerts" + (" ⚡ ELEVATED" if china_alerts >= 3 else ""))
-    print(f"  Iran/Hormuz:   {iran_alerts} news alerts" + (" ⚡ ELEVATED" if iran_alerts >= 3 else ""))
-    print(f"  Oil:           {oil_alerts} news alerts" + (" ⚡ ELEVATED" if oil_alerts >= 3 else ""))
-    print(f"  UK Politics:   {uk_alerts} news alerts" + (" ⚡ ELEVATED" if uk_alerts >= 2 else ""))
+    print(f"  China/Taiwan:  {china_alerts} news alerts" + (" *** ELEVATED" if china_alerts >= 3 else ""))
+    print(f"  Iran/Hormuz:   {iran_alerts} news alerts" + (" *** ELEVATED" if iran_alerts >= 3 else ""))
+    print(f"  Oil:           {oil_alerts} news alerts" + (" *** ELEVATED" if oil_alerts >= 3 else ""))
+    print(f"  UK Politics:   {uk_alerts} news alerts" + (" *** ELEVATED" if uk_alerts >= 2 else ""))
 
     quake_count = len(quakes) if isinstance(quakes, list) else 0
     if quake_count >= 3:
-        print(f"  Earthquakes:   {quake_count} significant events — CHECK POLYMARKET EARTHQUAKE MARKETS")
+        print(f"  Earthquakes:   {quake_count} significant events -- CHECK POLYMARKET EARTHQUAKE MARKETS")
 
 
 def news_only():
@@ -368,11 +427,14 @@ if __name__ == "__main__":
         quakes = get_earthquakes(min_magnitude=4.5, days=7)
         if isinstance(quakes, list):
             for q in quakes:
-                print(f"M{q['magnitude']} — {q['place']} ({q['time']})")
+                print(f"M{q['magnitude']} -- {q['place']} ({q['time']})")
     elif cmd == "flights":
         print("Taiwan Strait:")
         print(json.dumps(get_military_flights_taiwan(), indent=2))
         print("\nHormuz:")
         print(json.dumps(get_military_flights_hormuz(), indent=2))
+    elif cmd == "crypto":
+        crypto = get_crypto_prices()
+        print(json.dumps(crypto, indent=2))
     else:
-        print("Usage: python3 intel.py [full|news|quakes|flights]")
+        print("Usage: python3 intel.py [full|news|quakes|flights|crypto]")

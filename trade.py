@@ -59,10 +59,19 @@ if __name__ == "__main__":
 
     cmd = sys.argv[1]
     if cmd == "price":
+        if len(sys.argv) < 3:
+            print("Usage: python3 trade.py price <token_id>")
+            sys.exit(1)
         get_price(sys.argv[2])
     elif cmd == "buy":
+        if len(sys.argv) < 5:
+            print("Usage: python3 trade.py buy <token_id> <price> <size>")
+            sys.exit(1)
         buy(sys.argv[2], float(sys.argv[3]), float(sys.argv[4]))
     elif cmd == "sell":
+        if len(sys.argv) < 5:
+            print("Usage: python3 trade.py sell <token_id> <price> <size>")
+            sys.exit(1)
         sell(sys.argv[2], float(sys.argv[3]), float(sys.argv[4]))
     elif cmd == "orders":
         get_orders()

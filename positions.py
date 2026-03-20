@@ -24,12 +24,28 @@ def get_address():
     return account.address
 
 
+def get_balance():
+    """Get available USDC balance from the Polymarket CLOB."""
+    from proxy_client import get_client
+    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+    client = get_client(with_auth=True)
+    params = BalanceAllowanceParams(
+        asset_type=AssetType.COLLATERAL,
+        signature_type=int(os.getenv("SIGNATURE_TYPE", "1")),
+    )
+    result = client.get_balance_allowance(params)
+    raw = int(result.get("balance", 0))
+    balance = raw / 1e6
+    return balance
+
+
 def get_positions():
     """Get current open positions."""
     address = get_address()
     print(f"Wallet: {address}\n")
 
-    resp = httpx.get(f"{DATA_API}/positions", params={"user": address})
+    resp = httpx.get(f"{DATA_API}/positions", params={"user": address}, timeout=15)
     resp.raise_for_status()
     positions = resp.json()
 
@@ -50,7 +66,7 @@ def get_positions():
 def get_portfolio_value():
     """Get total portfolio value."""
     address = get_address()
-    resp = httpx.get(f"{DATA_API}/value", params={"user": address})
+    resp = httpx.get(f"{DATA_API}/value", params={"user": address}, timeout=15)
     resp.raise_for_status()
     data = resp.json()
     print(f"Wallet: {address}")
@@ -62,7 +78,10 @@ if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "positions"
     if cmd == "positions":
         get_positions()
+    elif cmd == "balance":
+        bal = get_balance()
+        print(f"Available USDC: ${bal:.2f}")
     elif cmd == "value":
         get_portfolio_value()
     else:
-        print("Usage: python positions.py [positions|value]")
+        print("Usage: python positions.py [positions|balance|value]")

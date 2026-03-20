@@ -38,10 +38,27 @@ def init_funds(amount):
 def deposit(amount):
     """Add funds."""
     ledger = _load()
-    ledger["funds"] += amount
-    ledger["initial_deposit"] += amount
+    ledger["funds"] = round(ledger["funds"] + amount, 6)
+    ledger["initial_deposit"] = round(ledger["initial_deposit"] + amount, 6)
     _save(ledger)
     print(f"Deposited ${amount:.2f}. Total funds: ${ledger['funds']:.2f}")
+
+
+def sync():
+    """Sync ledger funds with on-chain USDC balance."""
+    from positions import get_balance
+    on_chain = get_balance()
+    ledger = _load()
+    old = ledger["funds"]
+    diff = round(on_chain - old, 6)
+    if abs(diff) < 0.01:
+        print(f"Ledger in sync (${on_chain:.2f})")
+        return
+    ledger["funds"] = round(on_chain, 6)
+    if diff > 0:
+        ledger["initial_deposit"] = round(ledger["initial_deposit"] + diff, 6)
+    _save(ledger)
+    print(f"Synced: ${old:.2f} -> ${on_chain:.2f} (diff: ${diff:+.2f})")
 
 
 def get_funds():
@@ -60,11 +77,26 @@ def record_buy(market, side, price, size, token_id="", notes="",
                tp1_pct=0.50, tick_size="0.01", neg_risk=False):
     """Record opening a position. Optionally set monitor rules."""
     ledger = _load()
-    cost = price * size
+    cost = round(price * size, 6)
 
     if cost > ledger["funds"] * 0.20:
         print(f"WARNING: Bet ${cost:.2f} exceeds 20% limit (${ledger['funds'] * 0.20:.2f})")
         print("Proceeding anyway — but this violates risk rules.")
+
+    # Check combined exposure on same token (multiple buys on same market)
+    if token_id:
+        existing_cost = sum(
+            b.get("cost", 0) for b in ledger["open_bets"]
+            if b.get("token_id") == token_id
+        )
+        if existing_cost > 0:
+            combined = existing_cost + cost
+            total_value = ledger["funds"] + sum(b.get("cost", 0) for b in ledger["open_bets"])
+            pct = (combined / total_value * 100) if total_value > 0 else 0
+            print(f"NOTE: Existing position on this token: ${existing_cost:.2f}")
+            print(f"  Combined exposure after this buy: ${combined:.2f} ({pct:.1f}% of portfolio)")
+            if pct > 20:
+                print(f"  WARNING: Combined position exceeds 20% limit!")
 
     bet = {
         "id": len(ledger["trades"]) + 1,
@@ -92,7 +124,7 @@ def record_buy(market, side, price, size, token_id="", notes="",
             "neg_risk": neg_risk,
         }
 
-    ledger["funds"] -= cost
+    ledger["funds"] = round(ledger["funds"] - cost, 6)
     ledger["trades"].append(bet)
     ledger["open_bets"].append(bet)
     _save(ledger)
@@ -156,9 +188,13 @@ def record_sell(bet_id, sell_price, size=None, notes=""):
     if size is None:
         size = bet["size"]
 
-    revenue = sell_price * size
-    cost = bet["price"] * size
-    pnl = revenue - cost
+    if size > bet["size"]:
+        print(f"WARNING: Sell size {size} exceeds position size {bet['size']}. Clamping to {bet['size']}.")
+        size = bet["size"]
+
+    revenue = round(sell_price * size, 6)
+    cost = round(bet["price"] * size, 6)
+    pnl = round(revenue - cost, 6)
 
     sell_record = {
         "id": len(ledger["trades"]) + 1,
@@ -176,18 +212,21 @@ def record_sell(bet_id, sell_price, size=None, notes=""):
         "original_bet_id": bet_id,
     }
 
-    ledger["funds"] += revenue
-    ledger["pnl_total"] += pnl
+    ledger["funds"] = round(ledger["funds"] + revenue, 6)
+    ledger["pnl_total"] = round(ledger["pnl_total"] + pnl, 6)
     ledger["trades"].append(sell_record)
 
     # Close the bet (or reduce size for partial sells)
-    remaining = bet["size"] - size
+    remaining = round(bet["size"] - size, 6)
     if remaining <= 0:
         ledger["open_bets"] = [b for b in ledger["open_bets"] if b["id"] != bet_id]
         bet["status"] = "CLOSED"
         ledger["closed_bets"].append(bet)
     else:
+        # Reduce cost proportionally so future PnL calculations are correct
+        cost_per_share = bet["cost"] / bet["size"]
         bet["size"] = remaining
+        bet["cost"] = round(cost_per_share * remaining, 6)
 
     _save(ledger)
 
@@ -214,11 +253,11 @@ def record_resolution(bet_id, won, notes=""):
     if won:
         payout = bet["size"]  # Each share pays $1 if won
         pnl = payout - bet["cost"]
-        ledger["funds"] += payout
+        ledger["funds"] = round(ledger["funds"] + payout, 6)
     else:
         pnl = -bet["cost"]
 
-    ledger["pnl_total"] += pnl
+    ledger["pnl_total"] = round(ledger["pnl_total"] + pnl, 6)
 
     bet["status"] = "WON" if won else "LOST"
     bet["pnl"] = pnl
@@ -248,13 +287,27 @@ def status():
     """Print full portfolio status."""
     ledger = _load()
 
+    # Check real on-chain balance
+    on_chain = None
+    try:
+        from positions import get_balance
+        on_chain = get_balance()
+    except Exception:
+        pass
+
     print("=" * 60)
     print("PORTFOLIO STATUS")
     print("=" * 60)
     print(f"  Initial Deposit: ${ledger['initial_deposit']:.2f}")
-    print(f"  Current Funds:   ${ledger['funds']:.2f}")
+    print(f"  Ledger Funds:    ${ledger['funds']:.2f}")
+    if on_chain is not None:
+        print(f"  On-Chain USDC:   ${on_chain:.2f}")
+        diff = round(on_chain - ledger['funds'], 2)
+        if abs(diff) > 0.05:
+            print(f"  ** MISMATCH: ${diff:+.2f} (run 'ledger.py sync' to fix) **")
     print(f"  Total PnL:       ${ledger['pnl_total']:+.2f}")
-    print(f"  Max Single Bet:  ${ledger['funds'] * 0.20:.2f} (20%)")
+    funds = on_chain if on_chain is not None else ledger['funds']
+    print(f"  Max Single Bet:  ${funds * 0.20:.2f} (20%)")
 
     # Open positions value
     open_cost = sum(b["cost"] for b in ledger["open_bets"])
@@ -277,6 +330,28 @@ def status():
                     parts.append(f"TP2: {r['take_profit_2']}")
                 if parts:
                     print(f"       Rules: {' | '.join(parts)}")
+
+    # Show combined exposure when multiple bets on same token
+    if ledger["open_bets"]:
+        token_groups = {}
+        for b in ledger["open_bets"]:
+            tid = b.get("token_id", "")
+            if tid:
+                token_groups.setdefault(tid, []).append(b)
+        multi = {tid: bets for tid, bets in token_groups.items() if len(bets) > 1}
+        if multi:
+            total_value = ledger['funds'] + open_cost
+            print(f"\n  COMBINED POSITIONS:")
+            for tid, bets in multi.items():
+                combined_cost = sum(b["cost"] for b in bets)
+                combined_shares = sum(b["size"] for b in bets)
+                avg_price = combined_cost / combined_shares if combined_shares > 0 else 0
+                pct = (combined_cost / total_value * 100) if total_value > 0 else 0
+                ids = [b["id"] for b in bets]
+                name = bets[0]["market"][:50]
+                flag = " *** OVER 20% ***" if pct > 20 else ""
+                print(f"    {name}")
+                print(f"       IDs: {ids}  |  {combined_shares} shares @ avg {avg_price:.4f}  |  ${combined_cost:.2f} ({pct:.1f}%){flag}")
 
     if ledger["closed_bets"]:
         print(f"\n  CLOSED BETS ({len(ledger['closed_bets'])}):")
@@ -320,13 +395,21 @@ if __name__ == "__main__":
 
     cmd = sys.argv[1]
     if cmd == "init":
+        if len(sys.argv) < 3:
+            print("Usage: python3 ledger.py init <amount>")
+            sys.exit(1)
         init_funds(float(sys.argv[2]))
     elif cmd == "deposit":
+        if len(sys.argv) < 3:
+            print("Usage: python3 ledger.py deposit <amount>")
+            sys.exit(1)
         deposit(float(sys.argv[2]))
     elif cmd == "status":
         status()
     elif cmd == "history":
         history()
+    elif cmd == "sync":
+        sync()
     elif cmd == "max-bet":
         print(f"Max single bet: ${get_max_bet():.2f} (20% of ${get_funds():.2f})")
     elif cmd == "set-rules":

@@ -53,6 +53,46 @@ def get_best_bid(token_id):
         return None
 
 
+def get_book_depth(token_id, side="bids"):
+    """Get order book depth on a given side. Returns list of (price, size) tuples."""
+    try:
+        client = get_client(with_auth=False)
+        book = client.get_order_book(token_id)
+        orders = book.bids if side == "bids" else book.asks
+        if not orders:
+            return []
+        return [(float(o.price), float(o.size)) for o in orders]
+    except Exception as e:
+        print(f"  Error getting book depth: {e}")
+        return []
+
+
+def check_liquidity(token_id, size, side="bids"):
+    """Check if there's enough liquidity to exit a position.
+    Returns (executable, avg_price, total_depth) tuple.
+    - executable: True if enough depth to fill 'size' shares
+    - avg_price: weighted average fill price
+    - total_depth: total shares available on this side
+    """
+    depth = get_book_depth(token_id, side)
+    if not depth:
+        return False, 0, 0
+
+    total_depth = sum(d[1] for d in depth)
+    filled = 0
+    cost = 0
+    for price, available in depth:
+        take = min(available, size - filled)
+        cost += take * price
+        filled += take
+        if filled >= size:
+            break
+
+    executable = filled >= size
+    avg_price = cost / filled if filled > 0 else 0
+    return executable, avg_price, total_depth
+
+
 def execute_sell(bet, shares, reason):
     """Execute a sell order for a bet."""
     token_id = bet["token_id"]
@@ -76,12 +116,23 @@ def execute_sell(bet, shares, reason):
             tick_size=tick_size,
             neg_risk=neg_risk,
         )
-        if resp.get("success"):
-            record_sell(bet["id"], bid, shares, notes=reason)
-            print(f"  SOLD: {resp}")
+        # OrderResponse may be a dict or object -- check for order ID as success signal
+        order_id = None
+        if isinstance(resp, dict):
+            order_id = resp.get("orderID") or resp.get("order_id") or resp.get("id")
+        else:
+            order_id = getattr(resp, "orderID", None) or getattr(resp, "order_id", None) or getattr(resp, "id", None)
+
+        if order_id:
+            try:
+                record_sell(bet["id"], bid, shares, notes=reason)
+            except Exception as le:
+                print(f"  CRITICAL: Sell order {order_id} succeeded but ledger update failed: {le}")
+                print(f"  MANUAL FIX NEEDED: bet #{bet['id']}, sold {shares} shares @ {bid}")
+            print(f"  SOLD (order {order_id}): {resp}")
             return True
         else:
-            print(f"  SELL FAILED: {resp}")
+            print(f"  SELL FAILED (no order ID): {resp}")
             return False
     except Exception as e:
         print(f"  SELL ERROR: {e}")
@@ -111,9 +162,9 @@ def check_rules(verbose=True):
     for bet in bets:
         rules = bet["rules"]
         token_id = bet["token_id"]
-        total_shares = bet["size"]
+        remaining_shares = bet["size"]  # Current size (may be reduced after partial sells)
 
-        if total_shares <= 0:
+        if remaining_shares <= 0:
             continue
 
         # Get current price
@@ -131,7 +182,7 @@ def check_rules(verbose=True):
 
         if verbose:
             print(f"\n  {bet['market'][:50]}")
-            print(f"    Price: {mid:.4f}  |  Shares: {total_shares}")
+            print(f"    Price: {mid:.4f}  |  Shares: {remaining_shares}")
             parts = []
             if stop_loss is not None:
                 parts.append(f"Stop: {stop_loss}")
@@ -144,29 +195,41 @@ def check_rules(verbose=True):
         # STOP LOSS
         if stop_loss is not None and mid <= stop_loss:
             print(f"  *** STOP LOSS TRIGGERED @ {mid} (limit: {stop_loss}) ***")
-            success = execute_sell(bet, total_shares, f"Stop loss @ {mid}")
+            success = execute_sell(bet, remaining_shares, f"Stop loss @ {mid}")
             if success:
-                actions_taken.append(f"STOP LOSS: {bet['market'][:40]} sold {total_shares} shares @ ~{mid}")
+                actions_taken.append(f"STOP LOSS: {bet['market'][:40]} sold {remaining_shares} shares @ ~{mid}")
             continue
 
         # TAKE PROFIT 1
         if not tp1_hit and tp1 is not None and mid >= tp1:
-            sell_shares = int(total_shares * tp1_pct)
+            sell_shares = max(1, round(remaining_shares * tp1_pct))
+            if sell_shares > remaining_shares:
+                sell_shares = remaining_shares
             if sell_shares > 0:
                 print(f"  *** TAKE PROFIT 1 TRIGGERED @ {mid} ***")
                 success = execute_sell(bet, sell_shares, f"Take profit 1 @ {mid}")
                 if success:
                     state[f"bet_{bet['id']}_tp1_hit"] = True
                     save_state(state)
+                    # Also persist tp1_hit in the ledger rules as backup
+                    try:
+                        ledger = _load()
+                        for b in ledger["open_bets"]:
+                            if b["id"] == bet["id"] and b.get("rules"):
+                                b["rules"]["tp1_hit"] = True
+                                break
+                        _save(ledger)
+                    except Exception as e:
+                        print(f"  Warning: Could not persist tp1_hit to ledger: {e}")
                     actions_taken.append(f"TP1: {bet['market'][:40]} sold {sell_shares} shares @ ~{mid}")
             continue
 
         # TAKE PROFIT 2
         if tp1_hit and tp2 is not None and mid >= tp2:
             print(f"  *** TAKE PROFIT 2 TRIGGERED @ {mid} ***")
-            success = execute_sell(bet, total_shares, f"Take profit 2 @ {mid}")
+            success = execute_sell(bet, remaining_shares, f"Take profit 2 @ {mid}")
             if success:
-                actions_taken.append(f"TP2: {bet['market'][:40]} sold {total_shares} shares @ ~{mid}")
+                actions_taken.append(f"TP2: {bet['market'][:40]} sold {remaining_shares} shares @ ~{mid}")
             continue
 
         if verbose:
@@ -208,7 +271,20 @@ if __name__ == "__main__":
         run_loop(interval)
     elif len(sys.argv) > 1 and sys.argv[1] == "check":
         check_rules(verbose=True)
+    elif len(sys.argv) > 1 and sys.argv[1] == "liquidity":
+        if len(sys.argv) < 4:
+            print("Usage: python3 monitor.py liquidity <token_id> <size>")
+            sys.exit(1)
+        token_id = sys.argv[2]
+        size = float(sys.argv[3])
+        executable, avg_price, total_depth = check_liquidity(token_id, size)
+        print(f"Token: {token_id[:16]}...")
+        print(f"  Requested: {size} shares")
+        print(f"  Executable: {'YES' if executable else 'NO'}")
+        print(f"  Avg fill price: {avg_price:.4f}")
+        print(f"  Total bid depth: {total_depth:.1f} shares")
     else:
         print("Usage:")
-        print("  python3 monitor.py check          # Check once")
-        print("  python3 monitor.py loop [seconds]  # Continuous monitoring")
+        print("  python3 monitor.py check                        # Check once")
+        print("  python3 monitor.py loop [seconds]                # Continuous monitoring")
+        print("  python3 monitor.py liquidity <token_id> <size>   # Check exit liquidity")
