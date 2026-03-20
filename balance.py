@@ -1,5 +1,6 @@
 """Check on-chain wallet balances on Polygon."""
 import os
+import sys
 from dotenv import load_dotenv
 from eth_account import Account
 from web3 import Web3
@@ -27,7 +28,11 @@ ERC20_ABI = [
 
 
 def get_address():
-    key = os.getenv("POLYMARKET_PRIVATE_KEY")
+    key = os.getenv("POLYMARKET_PRIVATE_KEY", "")
+    if not key or key == "0xYOUR_PRIVATE_KEY_HERE" or len(key) < 10:
+        print("ERROR: No valid private key configured.")
+        print("  Set POLYMARKET_PRIVATE_KEY in your .env file.")
+        sys.exit(1)
     return Account.from_key(key).address
 
 

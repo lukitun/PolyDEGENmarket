@@ -1,9 +1,9 @@
 """Check wallet positions and balance."""
+import os
 import sys
 import httpx
 from eth_account import Account
 from dotenv import load_dotenv
-import os
 
 load_dotenv()
 
@@ -12,7 +12,11 @@ DATA_API = "https://data-api.polymarket.com"
 
 def get_address():
     """Derive wallet address from private key."""
-    key = os.getenv("POLYMARKET_PRIVATE_KEY")
+    key = os.getenv("POLYMARKET_PRIVATE_KEY", "")
+    if not key or key == "0xYOUR_PRIVATE_KEY_HERE" or len(key) < 10:
+        print("ERROR: No valid private key configured.")
+        print("  Set POLYMARKET_PRIVATE_KEY in your .env file.")
+        sys.exit(1)
     account = Account.from_key(key)
     return account.address
 

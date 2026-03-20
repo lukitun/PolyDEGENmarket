@@ -4,6 +4,7 @@ If SOCKS_PROXY is set in .env, all requests go through it.
 Otherwise, connects directly (works fine in non-blocked regions like the US).
 """
 import os
+import sys
 import httpx as _httpx
 from dotenv import load_dotenv
 
@@ -30,14 +31,22 @@ from py_clob_client.order_builder.constants import BUY, SELL
 from py_clob_client.clob_types import OrderArgs, CreateOrderOptions
 
 HOST = os.getenv("POLYMARKET_HOST", "https://clob.polymarket.com")
-KEY = os.getenv("POLYMARKET_PRIVATE_KEY")
+KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
 CHAIN_ID = int(os.getenv("CHAIN_ID", "137"))
 SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "1"))
 FUNDER = os.getenv("FUNDER", "")
 
 
+def _check_key():
+    if not KEY or KEY == "0xYOUR_PRIVATE_KEY_HERE" or len(KEY) < 10:
+        print("ERROR: No valid private key configured.")
+        print("  Set POLYMARKET_PRIVATE_KEY in your .env file.")
+        sys.exit(1)
+
+
 def get_client(with_auth=True):
     """Get a ClobClient instance. Uses proxy if configured."""
+    _check_key()
     client = ClobClient(
         HOST,
         key=KEY,
