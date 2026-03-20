@@ -28,6 +28,10 @@ ERC20_ABI = [
 
 
 def get_address():
+    """Get the wallet address to check. Uses FUNDER if set (proxy wallet), otherwise derives from PK."""
+    funder = os.getenv("FUNDER", "").strip()
+    if funder:
+        return funder
     key = os.getenv("POLYMARKET_PRIVATE_KEY", "")
     if not key or key == "0xYOUR_PRIVATE_KEY_HERE" or len(key) < 10:
         print("ERROR: No valid private key configured.")
