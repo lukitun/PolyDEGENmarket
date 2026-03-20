@@ -196,14 +196,6 @@ def run_loop(interval=60):
                 print("\n  ACTIONS TAKEN:")
                 for a in actions:
                     print(f"    -> {a}")
-
-                # Optional: sync to Google Drive after trades
-                try:
-                    from gdrive import sync_all
-                    print("\n  Syncing to Google Drive...")
-                    sync_all()
-                except Exception as ge:
-                    print(f"  GDrive sync skipped: {ge}")
         except Exception as e:
             print(f"  Monitor error: {e}")
 

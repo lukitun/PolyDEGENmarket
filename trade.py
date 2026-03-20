@@ -1,32 +1,17 @@
 """Place and manage trades on Polymarket."""
 import sys
-from client import get_client
-from py_clob_client.order_builder.constants import BUY, SELL
+from proxy_client import get_client, buy as _buy, sell as _sell
 
 
 def buy(token_id, price, size, tick_size="0.01", neg_risk=False):
     """Buy shares of an outcome token."""
-    client = get_client(with_auth=True)
-    order = client.create_and_post_order({
-        "token_id": token_id,
-        "price": price,
-        "size": size,
-        "side": BUY,
-    }, options={"tick_size": tick_size, "neg_risk": neg_risk})
-    print(f"Order placed: {order}")
+    order = _buy(token_id, price, size, tick_size=tick_size, neg_risk=neg_risk)
     return order
 
 
 def sell(token_id, price, size, tick_size="0.01", neg_risk=False):
     """Sell shares of an outcome token."""
-    client = get_client(with_auth=True)
-    order = client.create_and_post_order({
-        "token_id": token_id,
-        "price": price,
-        "size": size,
-        "side": SELL,
-    }, options={"tick_size": tick_size, "neg_risk": neg_risk})
-    print(f"Order placed: {order}")
+    order = _sell(token_id, price, size, tick_size=tick_size, neg_risk=neg_risk)
     return order
 
 
@@ -52,7 +37,7 @@ def cancel_all():
 
 def get_price(token_id):
     """Get current price for a token."""
-    client = get_client()
+    client = get_client(with_auth=False)
     book = client.get_order_book(token_id)
     print(f"Market: {token_id[:16]}...")
     print(f"  Best Bid: {book.bids[0].price if book.bids else 'N/A'}")

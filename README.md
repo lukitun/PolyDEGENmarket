@@ -85,7 +85,6 @@ python3 intel.py quakes           # Recent earthquakes
 python3 kelly.py 0.75 0.40        # Kelly criterion sizing (true_prob, market_price)
 python3 positions.py              # On-chain wallet positions
 python3 balance.py                # Wallet balances (POL, USDC)
-python3 gdrive.py                 # Sync portfolio to Google Drive (optional)
 ```
 
 ## Strategy
@@ -130,9 +129,7 @@ polymarkt/
 ├── intel.py           # News, earthquakes, flight tracking
 ├── positions.py       # On-chain position checker
 ├── balance.py         # Wallet balance checker
-├── proxy_client.py    # Optional SOCKS5 proxy for geo-blocked regions
-├── client.py          # Base Polymarket CLOB client
-├── gdrive.py          # Google Drive sync (optional)
+├── proxy_client.py    # Polymarket CLOB client (optional SOCKS5 proxy)
 ├── plays/             # Trade plan documents
 ├── STRATEGY.md        # Trading strategy details
 ├── STRATEGIES.md      # Strategy evolution notes

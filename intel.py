@@ -303,20 +303,24 @@ def full_report():
     print("\n\n[FLIGHT ACTIVITY]")
     print("-" * 40)
     taiwan = get_military_flights_taiwan()
-    if isinstance(taiwan, list):
+    if isinstance(taiwan, list) and taiwan:
         print(f"  Taiwan Strait area: {len(taiwan)} aircraft detected")
         for ac in taiwan[:5]:
             print(f"    {ac['type'] or 'Unknown'} @ {ac['alt']}ft ({ac['lat']:.2f}, {ac['lon']:.2f})")
+    elif isinstance(taiwan, dict) and "error" in taiwan:
+        print(f"  Taiwan flights: unavailable ({taiwan['error'][:60]})")
     else:
-        print(f"  Taiwan: {taiwan}")
+        print("  Taiwan Strait area: no aircraft detected")
 
     hormuz = get_military_flights_hormuz()
-    if isinstance(hormuz, list):
+    if isinstance(hormuz, list) and hormuz:
         print(f"  Hormuz area: {len(hormuz)} aircraft detected")
         for ac in hormuz[:5]:
             print(f"    {ac['type'] or 'Unknown'} @ {ac['alt']}ft ({ac['lat']:.2f}, {ac['lon']:.2f})")
+    elif isinstance(hormuz, dict) and "error" in hormuz:
+        print(f"  Hormuz flights: unavailable ({hormuz['error'][:60]})")
     else:
-        print(f"  Hormuz: {hormuz}")
+        print("  Hormuz area: no aircraft detected")
 
     # Summary
     print("\n\n[SIGNAL SUMMARY]")

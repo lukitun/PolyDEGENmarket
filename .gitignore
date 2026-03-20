@@ -6,7 +6,8 @@ ledger.json
 monitor_state.json
 monitor.log
 
-# Google Drive credentials
+# Google Drive (optional, not part of public tool)
+gdrive.py
 credentials.json
 gdrive_token.json
 gdrive_folder_id.txt
