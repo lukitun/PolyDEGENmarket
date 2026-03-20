@@ -1,5 +1,8 @@
 # Secrets
 .env
+*.key
+*.key.pub
+alerts.log
 
 # Personal data
 ledger.json
@@ -7,12 +10,16 @@ monitor_state.json
 monitor.log
 watchlist.json
 equity_history.json
+news_alerts.json
 
 # Google Drive (optional, not part of public tool)
 gdrive.py
 credentials.json
 gdrive_token.json
 gdrive_folder_id.txt
+
+# Logs (contain runtime data, not code)
+logs/
 
 # Python
 __pycache__/

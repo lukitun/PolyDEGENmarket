@@ -68,8 +68,16 @@ def get_funds():
 
 
 def get_max_bet():
-    """Get maximum allowed bet size (20% of funds)."""
-    return get_funds() * 0.20
+    """Get maximum allowed bet size (20% of total portfolio value).
+
+    Total portfolio = available funds + cost of all open positions.
+    This matches the 20% risk rule from STRATEGIES.md.
+    """
+    ledger = _load()
+    funds = ledger["funds"]
+    open_cost = sum(b.get("cost", 0) for b in ledger.get("open_bets", []))
+    total_value = funds + open_cost
+    return total_value * 0.20
 
 
 def record_buy(market, side, price, size, token_id="", notes="",
@@ -221,8 +229,12 @@ def record_sell(bet_id, sell_price, size=None, notes=""):
     if remaining <= 0:
         ledger["open_bets"] = [b for b in ledger["open_bets"] if b["id"] != bet_id]
         bet["status"] = "CLOSED"
+        # Accumulate PnL on the bet record so status display can show it
+        bet["pnl"] = round(bet.get("pnl", 0) + pnl, 6)
         ledger["closed_bets"].append(bet)
     else:
+        # Partial sell -- accumulate realized PnL on the bet for tracking
+        bet["pnl"] = round(bet.get("pnl", 0) + pnl, 6)
         # Reduce cost proportionally so future PnL calculations are correct
         cost_per_share = bet["cost"] / bet["size"]
         bet["size"] = remaining
@@ -283,6 +295,29 @@ def record_resolution(bet_id, won, notes=""):
     return resolution
 
 
+def _fetch_live_prices(open_bets):
+    """Fetch live midpoint prices for all open positions.
+    Returns dict of {token_id: price} or empty dict on failure.
+    """
+    live_prices = {}
+    if not open_bets:
+        return live_prices
+    try:
+        from monitor import get_midpoint
+        # Deduplicate tokens
+        token_ids = set(b.get("token_id", "") for b in open_bets if b.get("token_id"))
+        for tid in token_ids:
+            try:
+                mid = get_midpoint(tid)
+                if mid is not None and mid > 0:
+                    live_prices[tid] = mid
+            except Exception:
+                pass
+    except ImportError:
+        pass
+    return live_prices
+
+
 def status():
     """Print full portfolio status."""
     ledger = _load()
@@ -294,6 +329,9 @@ def status():
         on_chain = get_balance()
     except Exception:
         pass
+
+    # Fetch live prices for unrealized P&L
+    live_prices = _fetch_live_prices(ledger.get("open_bets", []))
 
     print("=" * 60)
     print("PORTFOLIO STATUS")
@@ -309,16 +347,46 @@ def status():
     funds = on_chain if on_chain is not None else ledger['funds']
     print(f"  Max Single Bet:  ${funds * 0.20:.2f} (20%)")
 
-    # Open positions value
+    # Open positions value -- both book and live
     open_cost = sum(b["cost"] for b in ledger["open_bets"])
-    print(f"  In Open Bets:    ${open_cost:.2f}")
-    print(f"  Total Value:     ${ledger['funds'] + open_cost:.2f}")
+    total_unrealized = 0
+    market_value_total = 0
+    has_prices = bool(live_prices)
+
+    if has_prices:
+        for b in ledger["open_bets"]:
+            tid = b.get("token_id", "")
+            if tid in live_prices:
+                mv = live_prices[tid] * b["size"]
+                market_value_total += mv
+                total_unrealized += mv - b["cost"]
+            else:
+                market_value_total += b["cost"]  # fallback to cost
+    else:
+        market_value_total = open_cost
+
+    print(f"  In Open Bets:    ${open_cost:.2f} (cost basis)")
+    if has_prices:
+        print(f"  Market Value:    ${market_value_total:.2f} (live)")
+        print(f"  Unrealized PnL:  ${total_unrealized:+.2f}")
+        total_live = ledger['funds'] + market_value_total
+        print(f"  Total Value:     ${total_live:.2f} (live)")
+    else:
+        print(f"  Total Value:     ${ledger['funds'] + open_cost:.2f} (book)")
 
     if ledger["open_bets"]:
         print(f"\n  OPEN BETS ({len(ledger['open_bets'])}):")
         for b in ledger["open_bets"]:
+            tid = b.get("token_id", "")
+            mid = live_prices.get(tid)
             print(f"    #{b['id']} {b['market'][:50]}")
-            print(f"       {b['side']} @ {b['price']} x {b['size']} = ${b['cost']:.2f}  [{b['timestamp'][:10]}]")
+            price_line = f"       {b['side']} @ {b['price']} x {b['size']} = ${b['cost']:.2f}  [{b['timestamp'][:10]}]"
+            if mid is not None:
+                mv = mid * b["size"]
+                upnl = mv - b["cost"]
+                pct = (upnl / b["cost"] * 100) if b["cost"] > 0 else 0
+                price_line += f"  |  NOW {mid:.3f} = ${mv:.2f} ({upnl:+.2f} / {pct:+.1f}%)"
+            print(price_line)
             if b.get("rules"):
                 r = b["rules"]
                 parts = []
@@ -329,7 +397,16 @@ def status():
                 if r.get("take_profit_2") is not None:
                     parts.append(f"TP2: {r['take_profit_2']}")
                 if parts:
-                    print(f"       Rules: {' | '.join(parts)}")
+                    rule_line = f"       Rules: {' | '.join(parts)}"
+                    # Flag if near stop or TP
+                    if mid is not None:
+                        sl = r.get("stop_loss")
+                        tp1 = r.get("take_profit_1")
+                        if sl is not None and mid <= sl * 1.15:
+                            rule_line += "  ** NEAR STOP **"
+                        elif tp1 is not None and mid >= tp1 * 0.95:
+                            rule_line += "  ** NEAR TP1 **"
+                    print(rule_line)
 
     # Show combined exposure when multiple bets on same token
     if ledger["open_bets"]:
@@ -354,9 +431,19 @@ def status():
                 print(f"       IDs: {ids}  |  {combined_shares} shares @ avg {avg_price:.4f}  |  ${combined_cost:.2f} ({pct:.1f}%){flag}")
 
     if ledger["closed_bets"]:
+        # Build a lookup of PnL from sell/resolution trades for bets missing pnl field
+        _sell_pnl = {}
+        for t in ledger.get("trades", []):
+            if t.get("action") in ("SELL", "RESOLUTION") and "original_bet_id" in t:
+                bid = t["original_bet_id"]
+                _sell_pnl[bid] = _sell_pnl.get(bid, 0) + t.get("pnl", 0)
+
         print(f"\n  CLOSED BETS ({len(ledger['closed_bets'])}):")
         for b in ledger["closed_bets"][-10:]:  # Last 10
-            pnl = b.get("pnl", 0)
+            pnl = b.get("pnl", None)
+            if pnl is None or pnl == 0:
+                # Reconstruct from trade history
+                pnl = _sell_pnl.get(b["id"], 0)
             print(f"    #{b['id']} {b['market'][:50]}  ->  {b['status']}  (${pnl:+.2f})")
 
     # Win rate
@@ -411,7 +498,12 @@ if __name__ == "__main__":
     elif cmd == "sync":
         sync()
     elif cmd == "max-bet":
-        print(f"Max single bet: ${get_max_bet():.2f} (20% of ${get_funds():.2f})")
+        ledger = _load()
+        funds = ledger["funds"]
+        open_cost = sum(b.get("cost", 0) for b in ledger.get("open_bets", []))
+        total = funds + open_cost
+        print(f"Max single bet: ${get_max_bet():.2f} (20% of ${total:.2f} total value)")
+        print(f"  Available funds: ${funds:.2f}  |  In open bets: ${open_cost:.2f}")
     elif cmd == "set-rules":
         if len(sys.argv) < 6:
             print("Usage: python3 ledger.py set-rules <bet_id> <stop_loss> <tp1> <tp2> [tp1_pct]")

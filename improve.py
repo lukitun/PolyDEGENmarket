@@ -31,7 +31,7 @@ SENSITIVE_PATTERNS = [
 SENSITIVE_FILES = [
     ".env", "ledger.json", "credentials.json", "gdrive_token.json",
     "gdrive_folder_id.txt", "monitor.log", "monitor_state.json",
-    "watchlist.json", "equity_history.json",
+    "watchlist.json", "equity_history.json", "news_alerts.json",
 ]
 
 
@@ -153,6 +153,18 @@ def check_ledger_integrity():
             except (ValueError, TypeError):
                 pass
 
+    # Check closed bets have PnL recorded
+    for bet in closed_bets:
+        if bet.get("pnl") is None and bet.get("status") in ("CLOSED", "WON", "LOST"):
+            # Check if PnL exists in trade history
+            has_trade_pnl = any(
+                t.get("original_bet_id") == bet.get("id") and t.get("pnl") is not None
+                for t in ledger.get("trades", [])
+                if t.get("action") in ("SELL", "RESOLUTION")
+            )
+            if not has_trade_pnl:
+                issues.append(f"WARNING: Closed bet #{bet.get('id')} '{bet.get('market', '')[:40]}' has no PnL recorded anywhere")
+
     # Duplicate market detection (multiple bets on same token)
     token_bets = {}
     for bet in open_bets:
@@ -258,6 +270,13 @@ def check_code_quality():
                             break
                     break
 
+            # time.mktime used on UTC timestamps (should be calendar.timegm)
+            if 'time.mktime' in line and 'published' in line.lower():
+                issues.append(
+                    f"CODE: {pyfile}:{i} -- time.mktime() uses local timezone; "
+                    f"use calendar.timegm() for UTC timestamps from RSS feeds"
+                )
+
             # Unguarded sys.argv access (IndexError risk)
             argv_match = re.search(r'sys\.argv\[(\d+)\]', line)
             if argv_match and _is_inside_main_guard(lines, i - 1):
@@ -274,18 +293,11 @@ def check_code_quality():
 
 
 def check_reconciliation():
-    """Check ledger vs on-chain positions."""
+    """Check ledger vs on-chain positions and USDC balance."""
     issues = []
     ledger = load_ledger()
     if not ledger:
         return ["Cannot reconcile: no ledger.json"]
-
-    try:
-        from positions import get_positions
-        # This would need actual implementation -- placeholder for now
-        issues.append("INFO: Run 'python3 positions.py' manually and compare with ledger")
-    except ImportError:
-        pass
 
     # Check that all open bets have required fields
     for bet in ledger.get("open_bets", []):
@@ -293,6 +305,82 @@ def check_reconciliation():
         missing = [f for f in required if not bet.get(f)]
         if missing:
             issues.append(f"DATA: Bet #{bet.get('id', '?')} missing fields: {missing}")
+
+    # Try to check on-chain USDC balance
+    try:
+        from positions import get_balance
+        on_chain = get_balance()
+        ledger_funds = ledger.get("funds", 0)
+        diff = round(on_chain - ledger_funds, 2)
+        if abs(diff) > 0.50:
+            issues.append(
+                f"RISK: Ledger funds ${ledger_funds:.2f} vs on-chain USDC ${on_chain:.2f} "
+                f"(diff: ${diff:+.2f}) -- run 'ledger.py sync'"
+            )
+        elif abs(diff) > 0.05:
+            issues.append(
+                f"WARNING: Ledger funds ${ledger_funds:.2f} vs on-chain USDC ${on_chain:.2f} "
+                f"(diff: ${diff:+.2f})"
+            )
+        else:
+            issues.append(f"INFO: Ledger/on-chain USDC in sync (${on_chain:.2f})")
+    except Exception as e:
+        issues.append(f"INFO: Could not check on-chain balance: {e}")
+
+    # Try to check on-chain positions
+    try:
+        import httpx
+        from positions import get_address, DATA_API
+        address = get_address()
+        resp = httpx.get(
+            f"{DATA_API}/positions",
+            params={"user": address},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        on_chain_positions = resp.json()
+
+        ledger_tokens = set(
+            b.get("token_id", "") for b in ledger.get("open_bets", [])
+            if b.get("token_id")
+        )
+
+        on_chain_tokens = set()
+        for p in on_chain_positions:
+            asset = p.get("asset", "")
+            size = float(p.get("size", 0))
+            if size > 0.01 and asset:
+                on_chain_tokens.add(asset)
+
+        # Positions in ledger but not on-chain
+        ledger_only = ledger_tokens - on_chain_tokens
+        for tid in ledger_only:
+            bet_names = [
+                b.get("market", "?")[:40]
+                for b in ledger.get("open_bets", [])
+                if b.get("token_id") == tid
+            ]
+            issues.append(
+                f"WARNING: Ledger has position not found on-chain: {', '.join(bet_names)} "
+                f"(token: {tid[:16]}...)"
+            )
+
+        # Positions on-chain but not in ledger
+        chain_only = on_chain_tokens - ledger_tokens
+        for tid in chain_only:
+            matching = [p for p in on_chain_positions if p.get("asset") == tid]
+            for p in matching:
+                title = p.get("title", tid[:20])
+                size = p.get("size", "?")
+                issues.append(
+                    f"WARNING: On-chain position not in ledger: {title} (size: {size})"
+                )
+
+        if not ledger_only and not chain_only:
+            issues.append(f"INFO: Ledger positions match on-chain ({len(ledger_tokens)} positions)")
+
+    except Exception as e:
+        issues.append(f"INFO: Could not reconcile positions: {e}")
 
     return issues
 
@@ -318,6 +406,68 @@ def check_plays():
 
     if not play_files and open_markets:
         issues.append(f"WARNING: {len(open_markets)} open bets but no play files in plays/")
+
+    return issues
+
+
+def check_proxy_health():
+    """Check if the configured proxy is reachable."""
+    issues = []
+    env_file = os.path.join(BASE_DIR, ".env")
+    if not os.path.exists(env_file):
+        return issues
+
+    with open(env_file) as f:
+        env_content = f.read()
+
+    # Check if a proxy is configured
+    import re as _re
+    proxy_match = _re.search(r'^SOCKS_PROXY\s*=\s*(.+)$', env_content, _re.MULTILINE)
+    if not proxy_match:
+        return issues
+
+    proxy_url = proxy_match.group(1).strip()
+    if not proxy_url or proxy_url.startswith("#"):
+        return issues
+
+    # Try to test the proxy
+    try:
+        from proxy_client import check_proxy_health as _check_proxy, PROXY_LIST
+        ok, latency = _check_proxy(proxy_url, timeout=8)
+        if ok:
+            issues.append(f"INFO: Proxy healthy ({proxy_url}, {latency:.0f}ms)")
+        else:
+            issues.append(f"RISK: Proxy unreachable ({proxy_url}) -- trades will fail!")
+            if len(PROXY_LIST) > 1:
+                issues.append(f"INFO: {len(PROXY_LIST) - 1} fallback proxies configured")
+            else:
+                issues.append(f"WARNING: No fallback proxies. Set SOCKS_PROXY_LIST in .env")
+    except Exception as e:
+        issues.append(f"WARNING: Could not test proxy: {e}")
+
+    return issues
+
+
+def check_cron_health():
+    """Check cron jobs are correctly configured."""
+    issues = []
+    try:
+        import subprocess
+        crontab = subprocess.check_output(["crontab", "-l"], text=True, stderr=subprocess.DEVNULL)
+
+        # Check that all polymarkt cron entries use cd /root/polymarkt or absolute paths
+        for line in crontab.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Only check polymarkt-related entries
+            if "polymarkt" not in line.lower() and "equity" not in line.lower():
+                continue
+            # Check if it uses a bare python3 command without cd
+            if "python3 " in line and "cd /root/polymarkt" not in line and "/root/polymarkt/" not in line:
+                issues.append(f"WARNING: Cron entry may not find files (no cd or absolute path): {line[:80]}")
+    except Exception:
+        pass  # No crontab or crontab command not available
 
     return issues
 
@@ -377,6 +527,8 @@ def run_audit(mode="full"):
 
     if mode == "full":
         sections.append(("CODE QUALITY", check_code_quality))
+        sections.append(("PROXY HEALTH", check_proxy_health))
+        sections.append(("CRON HEALTH", check_cron_health))
         sections.append(("DATA FILES", check_data_files))
 
     if mode == "reconcile":

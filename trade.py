@@ -1,6 +1,10 @@
 """Place and manage trades on Polymarket."""
+import json
 import sys
+import httpx
 from proxy_client import get_client, buy as _buy, sell as _sell
+
+GAMMA_API = "https://gamma-api.polymarket.com"
 
 
 def buy(token_id, price, size, tick_size="0.01", neg_risk=False):
@@ -35,15 +39,75 @@ def cancel_all():
     return result
 
 
+def get_gamma_price(token_id):
+    """Get price from Gamma API as a fallback/cross-reference."""
+    try:
+        resp = httpx.get(f"{GAMMA_API}/markets", params={
+            "clob_token_ids": token_id,
+        }, timeout=15)
+        resp.raise_for_status()
+        markets = resp.json()
+        if not markets:
+            return None, None
+
+        market = markets[0]
+        question = market.get("question", "")
+        prices_raw = market.get("outcomePrices", "")
+        tokens_raw = market.get("clobTokenIds", "")
+
+        if isinstance(prices_raw, str):
+            prices = json.loads(prices_raw)
+        else:
+            prices = prices_raw or []
+
+        if isinstance(tokens_raw, str):
+            tokens = json.loads(tokens_raw)
+        else:
+            tokens = tokens_raw or []
+
+        for i, tid in enumerate(tokens):
+            if tid == token_id and i < len(prices):
+                return float(prices[i]), question
+
+        if prices:
+            return float(prices[0]), question
+        return None, question
+    except Exception:
+        return None, None
+
+
 def get_price(token_id):
-    """Get current price for a token."""
-    client = get_client(with_auth=False)
-    book = client.get_order_book(token_id)
+    """Get current price for a token from multiple sources."""
     print(f"Market: {token_id[:16]}...")
-    print(f"  Best Bid: {book.bids[0].price if book.bids else 'N/A'}")
-    print(f"  Best Ask: {book.asks[0].price if book.asks else 'N/A'}")
-    mid = client.get_midpoint(token_id)
-    print(f"  Midpoint: {mid}")
+
+    # Source 1: CLOB order book
+    book = None
+    try:
+        client = get_client(with_auth=False)
+        book = client.get_order_book(token_id)
+        bid = book.bids[0].price if book.bids else 'N/A'
+        ask = book.asks[0].price if book.asks else 'N/A'
+        mid = client.get_midpoint(token_id)
+
+        # Flag phantom bids
+        bid_val = float(bid) if bid != 'N/A' else 0
+        bid_note = " (PHANTOM -- CLOB API bug)" if bid_val <= 0.005 and bid != 'N/A' else ""
+
+        print(f"  [CLOB] Best Bid: {bid}{bid_note}")
+        print(f"  [CLOB] Best Ask: {ask}")
+        print(f"  [CLOB] Midpoint: {mid}")
+    except Exception as e:
+        print(f"  [CLOB] Error: {e}")
+
+    # Source 2: Gamma API (more reliable for current price)
+    gamma_price, question = get_gamma_price(token_id)
+    if gamma_price is not None:
+        print(f"  [GAMMA] Price:   {gamma_price:.4f}")
+        if question:
+            print(f"  [GAMMA] Market:  {question}")
+    else:
+        print(f"  [GAMMA] Price:   unavailable")
+
     return book
 
 
