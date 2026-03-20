@@ -1,0 +1,29 @@
+# Secrets
+.env
+
+# Personal data
+ledger.json
+monitor_state.json
+monitor.log
+
+# Google Drive credentials
+credentials.json
+gdrive_token.json
+gdrive_folder_id.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Personal play files (keep example_play.md)
+plays/*.md
+!plays/example_play.md
+
+# Claude memory (personal)
+.claude/
