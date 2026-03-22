@@ -188,21 +188,29 @@ def get_client(with_auth=True):
     return client
 
 
-def _execute_order_with_retry(token_id, price, size, side, tick_size="0.01", neg_risk=False, max_retries=2):
-    """Execute an order with proxy failover. Tries next proxy on connection failures."""
+def _execute_order_with_retry(token_id, price, size, side, tick_size="0.01", neg_risk=False, order_type=None, max_retries=2):
+    """Execute an order with proxy failover. Tries next proxy on connection failures.
+
+    order_type: OrderType.GTC (limit, default) or OrderType.FOK (market).
+    """
+    from py_clob_client.clob_types import OrderType
+    if order_type is None:
+        order_type = OrderType.GTC
     label = "BUY" if side == BUY else "SELL"
+    type_label = "GTC" if order_type == OrderType.GTC else "FOK"
     last_error = None
 
     for attempt in range(max_retries + 1):
         proxy_used = ACTIVE_PROXY or "direct"
         try:
             client = get_client()
-            resp = client.create_and_post_order(
+            order = client.create_order(
                 OrderArgs(token_id=token_id, price=price, size=size, side=side),
-                CreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
+                CreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
             )
+            resp = client.post_order(order, orderType=order_type)
             record_proxy_success()
-            print(f"{label}: {resp}")
+            print(f"{label} ({type_label}): {resp}")
             return resp
         except (ConnectionError, OSError, TimeoutError) as e:
             # Connection-level failure -- likely proxy is dead
@@ -225,14 +233,14 @@ def _execute_order_with_retry(token_id, price, size, side, tick_size="0.01", neg
     raise last_error
 
 
-def buy(token_id, price, size, tick_size="0.01", neg_risk=False):
-    """Buy shares through proxy (with failover)."""
-    return _execute_order_with_retry(token_id, price, size, BUY, tick_size=tick_size, neg_risk=neg_risk)
+def buy(token_id, price, size, tick_size="0.01", neg_risk=False, order_type=None):
+    """Buy shares through proxy (with failover). Default: GTC limit order."""
+    return _execute_order_with_retry(token_id, price, size, BUY, tick_size=tick_size, neg_risk=neg_risk, order_type=order_type)
 
 
-def sell(token_id, price, size, tick_size="0.01", neg_risk=False):
-    """Sell shares through proxy (with failover)."""
-    return _execute_order_with_retry(token_id, price, size, SELL, tick_size=tick_size, neg_risk=neg_risk)
+def sell(token_id, price, size, tick_size="0.01", neg_risk=False, order_type=None):
+    """Sell shares through proxy (with failover). Default: GTC limit order."""
+    return _execute_order_with_retry(token_id, price, size, SELL, tick_size=tick_size, neg_risk=neg_risk, order_type=order_type)
 
 
 def scan_free_proxies(max_test=30, timeout=8):

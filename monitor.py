@@ -7,7 +7,7 @@ import httpx
 from datetime import datetime, timezone
 
 from proxy_client import get_client, sell, ACTIVE_PROXY
-from ledger import _load, _save, record_sell
+from ledger import _load, _save, record_sell, get_open_bets
 from alerts import alert as log_alert, CRITICAL, WARNING, INFO, TRADE
 
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -20,6 +20,15 @@ STATE_FILE = os.path.join(os.path.dirname(__file__), "monitor_state.json")
 _GAMMA_PRICE_CACHE = {}  # token_id -> (price, timestamp)
 _GAMMA_CACHE_TTL = 60  # seconds
 
+# Track consecutive price fetch failures per token for alerting.
+# Loaded from/saved to monitor_state.json so failures accumulate across cron invocations.
+_PRICE_FAIL_COUNTS = {}  # token_id -> count (loaded from state in check_rules/check_emergency)
+_PRICE_FAIL_ALERT_THRESHOLD = 3  # Alert after this many consecutive failures (= 6 minutes with 2min cron)
+
+# Retry config for failed stop-loss sells
+_SELL_RETRY_MAX = 2
+_SELL_RETRY_DELAY = 3  # seconds between retries
+
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -29,8 +38,13 @@ def load_state():
 
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
+    """Save monitor state atomically -- write to temp then rename."""
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, STATE_FILE)
 
 
 def get_gamma_price(token_id):
@@ -187,70 +201,93 @@ def check_liquidity(token_id, size, side="bids"):
 
 
 def execute_sell(bet, shares, reason):
-    """Execute a sell order for a bet."""
+    """Execute a sell order for a bet. Retries up to _SELL_RETRY_MAX times on failure."""
     token_id = bet["token_id"]
     rules = bet.get("rules", {})
     tick_size = rules.get("tick_size", "0.01")
     neg_risk = rules.get("neg_risk", False)
 
-    bid = get_best_bid(token_id)
-    if bid is None or bid <= 0.001:
-        print(f"  WARNING: No valid bid for {bet['market'][:50]}, skipping sell")
-        return False
-
-    print(f"  EXECUTING SELL: {bet['market'][:50]} x {shares} @ market (~{bid})")
-    print(f"  Reason: {reason}")
-
-    try:
-        resp = sell(
-            token_id=token_id,
-            price=bid,
-            size=shares,
-            tick_size=tick_size,
-            neg_risk=neg_risk,
-        )
-        # OrderResponse may be a dict or object -- check for order ID as success signal
-        order_id = None
-        if isinstance(resp, dict):
-            order_id = resp.get("orderID") or resp.get("order_id") or resp.get("id")
-        else:
-            order_id = getattr(resp, "orderID", None) or getattr(resp, "order_id", None) or getattr(resp, "id", None)
-
-        if order_id:
-            try:
-                record_sell(bet["id"], bid, shares, notes=reason)
-            except Exception as le:
-                print(f"  CRITICAL: Sell order {order_id} succeeded but ledger update failed: {le}")
-                print(f"  MANUAL FIX NEEDED: bet #{bet['id']}, sold {shares} shares @ {bid}")
-            print(f"  SOLD (order {order_id}): {resp}")
-            return True
-        else:
-            print(f"  SELL FAILED (no order ID): {resp}")
+    for attempt in range(_SELL_RETRY_MAX + 1):
+        bid = get_best_bid(token_id)
+        if bid is None or bid <= 0.001:
+            if attempt < _SELL_RETRY_MAX:
+                print(f"  WARNING: No valid bid for {bet['market'][:50]}, retrying in {_SELL_RETRY_DELAY}s... (attempt {attempt + 1})")
+                time.sleep(_SELL_RETRY_DELAY)
+                # Clear cache so retry fetches fresh price
+                _GAMMA_PRICE_CACHE.pop(token_id, None)
+                continue
+            print(f"  WARNING: No valid bid for {bet['market'][:50]} after {_SELL_RETRY_MAX + 1} attempts, skipping sell")
+            log_alert(
+                f"SELL ABANDONED (no bid): {bet['market'][:50]} -- no valid bid after {_SELL_RETRY_MAX + 1} attempts",
+                severity=CRITICAL, source="monitor"
+            )
             return False
-    except Exception as e:
-        print(f"  SELL ERROR: {e}")
-        return False
+
+        print(f"  EXECUTING SELL: {bet['market'][:50]} x {shares} @ market (~{bid})")
+        print(f"  Reason: {reason}")
+
+        try:
+            resp = sell(
+                token_id=token_id,
+                price=bid,
+                size=shares,
+                tick_size=tick_size,
+                neg_risk=neg_risk,
+            )
+            # OrderResponse may be a dict or object -- check for order ID as success signal
+            order_id = None
+            if isinstance(resp, dict):
+                order_id = resp.get("orderID") or resp.get("order_id") or resp.get("id")
+            else:
+                order_id = getattr(resp, "orderID", None) or getattr(resp, "order_id", None) or getattr(resp, "id", None)
+
+            if order_id:
+                try:
+                    record_sell(bet["id"], bid, shares, notes=reason)
+                except Exception as le:
+                    print(f"  CRITICAL: Sell order {order_id} succeeded but ledger update failed: {le}")
+                    print(f"  MANUAL FIX NEEDED: bet #{bet['id']}, sold {shares} shares @ {bid}")
+                    log_alert(
+                        f"LEDGER FAILURE: Sell order {order_id} placed but ledger update failed for bet #{bet['id']}. "
+                        f"MANUAL FIX NEEDED: sold {shares} shares @ {bid}",
+                        severity=CRITICAL, source="monitor"
+                    )
+                print(f"  SOLD (order {order_id}): {resp}")
+                return True
+            else:
+                if attempt < _SELL_RETRY_MAX:
+                    print(f"  SELL FAILED (no order ID): {resp} -- retrying in {_SELL_RETRY_DELAY}s... (attempt {attempt + 1})")
+                    time.sleep(_SELL_RETRY_DELAY)
+                    continue
+                print(f"  SELL FAILED (no order ID) after {_SELL_RETRY_MAX + 1} attempts: {resp}")
+                return False
+        except Exception as e:
+            if attempt < _SELL_RETRY_MAX:
+                print(f"  SELL ERROR: {e} -- retrying in {_SELL_RETRY_DELAY}s... (attempt {attempt + 1})")
+                time.sleep(_SELL_RETRY_DELAY)
+                continue
+            print(f"  SELL ERROR after {_SELL_RETRY_MAX + 1} attempts: {e}")
+            return False
+
+    return False
 
 
 def get_monitored_bets():
-    """Get all open bets that have monitor rules set."""
-    ledger = _load()
-    monitored = []
-    for bet in ledger["open_bets"]:
-        if bet.get("rules") and bet.get("token_id"):
-            monitored.append(bet)
-    return monitored
+    """Get all open positions that have monitor rules set."""
+    bets = get_open_bets()
+    return [b for b in bets if b.get("rules") and b.get("token_id")]
 
 
 def get_all_open_bets():
-    """Get ALL open bets (for emergency stop checking)."""
-    ledger = _load()
-    return [b for b in ledger["open_bets"] if b.get("token_id")]
+    """Get ALL open positions (for emergency stop checking)."""
+    return [b for b in get_open_bets() if b.get("token_id")]
 
 
 def check_rules(verbose=True):
     """Check all positions against their rules."""
+    global _PRICE_FAIL_COUNTS
     state = load_state()
+    _PRICE_FAIL_COUNTS = state.get("price_fail_counts", {})
     actions_taken = []
     bets = get_monitored_bets()
 
@@ -269,9 +306,19 @@ def check_rules(verbose=True):
         # Get current price
         mid = get_midpoint(token_id)
         if mid is None:
+            _PRICE_FAIL_COUNTS[token_id] = _PRICE_FAIL_COUNTS.get(token_id, 0) + 1
+            fail_count = _PRICE_FAIL_COUNTS[token_id]
             if verbose:
-                print(f"  {bet['market'][:50]}: Could not get price, skipping")
+                print(f"  {bet['market'][:50]}: Could not get price, skipping (fail #{fail_count})")
+            if fail_count == _PRICE_FAIL_ALERT_THRESHOLD:
+                log_alert(
+                    f"PRICE FETCH FAILING: {bet['market'][:50]} -- {fail_count} consecutive failures, "
+                    f"stop loss at {rules.get('stop_loss')} will NOT fire until price API recovers",
+                    severity=CRITICAL, source="monitor"
+                )
             continue
+        # Reset failure counter on success
+        _PRICE_FAIL_COUNTS.pop(token_id, None)
 
         stop_loss = rules.get("stop_loss")
         tp1 = rules.get("take_profit_1")
@@ -328,12 +375,12 @@ def check_rules(verbose=True):
                 if success:
                     state[f"bet_{bet['id']}_tp1_hit"] = True
                     save_state(state)
-                    # Also persist tp1_hit in the ledger rules as backup
+                    # Also persist tp1_hit in the ledger position rules
                     try:
                         ledger = _load()
-                        for b in ledger["open_bets"]:
-                            if b["id"] == bet["id"] and b.get("rules"):
-                                b["rules"]["tp1_hit"] = True
+                        for pos in ledger.get("positions", {}).values():
+                            if pos.get("pos_id") == bet["id"] and pos.get("rules"):
+                                pos["rules"]["tp1_hit"] = True
                                 break
                         _save(ledger)
                     except Exception as e:
@@ -361,6 +408,10 @@ def check_rules(verbose=True):
                 status = "NEAR TP1"
             print(f"    Status: {status}")
 
+    # Persist failure counts across cron invocations
+    state["price_fail_counts"] = _PRICE_FAIL_COUNTS
+    save_state(state)
+
     return actions_taken
 
 
@@ -370,6 +421,9 @@ def check_emergency_stops(max_loss_pct=0.40, verbose=True):
     Any position down more than max_loss_pct from entry gets auto-sold.
     This is the safety net -- catches positions that have no explicit stop set.
     """
+    global _PRICE_FAIL_COUNTS
+    state = load_state()
+    _PRICE_FAIL_COUNTS = state.get("price_fail_counts", {})
     actions_taken = []
     bets = get_all_open_bets()
     ruled_ids = {b["id"] for b in get_monitored_bets()}
@@ -387,9 +441,18 @@ def check_emergency_stops(max_loss_pct=0.40, verbose=True):
 
         mid = get_midpoint(token_id)
         if mid is None:
+            _PRICE_FAIL_COUNTS[token_id] = _PRICE_FAIL_COUNTS.get(token_id, 0) + 1
+            fail_count = _PRICE_FAIL_COUNTS[token_id]
             if verbose:
-                print(f"  [EMERGENCY] {bet['market'][:50]}: Could not get price")
+                print(f"  [EMERGENCY] {bet['market'][:50]}: Could not get price (fail #{fail_count})")
+            if fail_count == _PRICE_FAIL_ALERT_THRESHOLD:
+                log_alert(
+                    f"PRICE FETCH FAILING: {bet['market'][:50]} -- {fail_count} consecutive failures, "
+                    f"emergency stop will NOT fire until price API recovers",
+                    severity=CRITICAL, source="monitor"
+                )
             continue
+        _PRICE_FAIL_COUNTS.pop(token_id, None)
 
         loss_pct = (entry_price - mid) / entry_price if entry_price > 0 else 0
 
@@ -422,11 +485,36 @@ def check_emergency_stops(max_loss_pct=0.40, verbose=True):
                     severity=CRITICAL, source="monitor"
                 )
 
+    # Persist failure counts across cron invocations
+    state["price_fail_counts"] = _PRICE_FAIL_COUNTS
+    save_state(state)
+
     return actions_taken
 
 
+def sync_limit_orders(verbose=True):
+    """Sync GTC limit orders with exchange to detect fills.
+    Returns list of fill descriptions.
+    """
+    actions = []
+    try:
+        from limit_orders import sync_with_exchange, cleanup_stale
+        if verbose:
+            print("[LIMIT ORDER SYNC]")
+        cleanup_stale()
+        changes = sync_with_exchange()
+        for c in changes:
+            actions.append(f"LIMIT FILL: {c['market'][:40]} {c['level']} @ {c['price']}")
+    except ImportError:
+        pass  # limit_orders module not available
+    except Exception as e:
+        if verbose:
+            print(f"  Limit order sync error: {e}")
+    return actions
+
+
 def check_all(verbose=True):
-    """Run both rule-based stops and emergency stops. Returns all actions taken."""
+    """Run both rule-based stops, emergency stops, and limit order sync. Returns all actions taken."""
     actions = []
     if verbose:
         print("[RULE-BASED STOPS]")
@@ -434,6 +522,9 @@ def check_all(verbose=True):
     if verbose:
         print("\n[EMERGENCY STOPS (positions without rules)]")
     actions.extend(check_emergency_stops(verbose=verbose))
+    if verbose:
+        print()
+    actions.extend(sync_limit_orders(verbose=verbose))
     return actions
 
 
@@ -455,6 +546,10 @@ def run_loop(interval=60):
                     print(f"    -> {a}")
         except Exception as e:
             print(f"  Monitor error: {e}")
+            try:
+                log_alert(f"Monitor loop error: {e}", severity=WARNING, source="monitor")
+            except Exception:
+                pass  # Don't let alert logging kill the monitor
 
         time.sleep(interval)
 

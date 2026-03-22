@@ -72,7 +72,7 @@ def get_gamma_price(token_id):
         if prices:
             return float(prices[0]), question
         return None, question
-    except Exception:
+    except (httpx.HTTPError, ValueError, KeyError, OSError, json.JSONDecodeError) as e:
         return None, None
 
 

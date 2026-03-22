@@ -10,6 +10,11 @@ Usage:
     python3 execute.py adjust <bet_id> <actual_filled_size> [notes]  # Fix partial fill
     python3 execute.py resolve <bet_id> <won|lost> [notes]
     python3 execute.py dry-buy <token_id> <price> <size>  # Dry run (no order placed)
+    python3 execute.py place-limits [bet_id]              # Place GTC TP sell orders
+    python3 execute.py limit-status                       # Show active limit orders
+    python3 execute.py limit-sync                         # Detect filled TP orders
+    python3 execute.py limit-cancel [bet_id]              # Cancel TP limit orders
+    python3 execute.py limit-replace <bet_id>             # Re-place after level change
 
 Options for buy:
     --stop <price>      Set stop-loss price
@@ -19,6 +24,7 @@ Options for buy:
     --tick <size>        Tick size (default: 0.01)
     --neg-risk           Enable neg-risk mode
     --notes <text>       Trade notes
+    --force              Override 20% concentration block
 """
 import sys
 import os
@@ -28,13 +34,17 @@ from datetime import datetime, timezone
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from ledger import _load, _save, get_funds, get_max_bet, record_buy, record_sell, record_resolution
+from ledger import _load, _save, get_funds, get_max_bet, record_buy, record_sell, record_resolution, get_open_bets, _find_position
 from monitor import check_liquidity
 from alerts import alert as log_alert, CRITICAL, TRADE
 
 
-def preflight_buy(token_id, price, size, market_name="", side="YES"):
-    """Run pre-trade checks. Returns (ok, messages) tuple."""
+def preflight_buy(token_id, price, size, market_name="", side="YES", force=False):
+    """Run pre-trade checks. Returns (ok, messages) tuple.
+
+    When force=False (default), the trade is BLOCKED if combined exposure
+    on the same token would exceed 20% of portfolio. Use --force to override.
+    """
     messages = []
     ok = True
 
@@ -47,24 +57,37 @@ def preflight_buy(token_id, price, size, market_name="", side="YES"):
         messages.append(f"BLOCKED: Cost ${cost:.2f} exceeds available funds ${funds:.2f}")
         ok = False
 
-    # Check 20% rule
+    # Check 20% rule for this trade alone
     if cost > max_bet:
         messages.append(f"WARNING: Cost ${cost:.2f} exceeds 20% limit ${max_bet:.2f}")
-        # Allow but warn -- ledger.py also warns
 
-    # Check combined exposure on same token
-    ledger = _load()
+    # Check combined exposure on same token (hard block unless --force)
+    open_bets = get_open_bets()
     existing_cost = sum(
-        b.get("cost", 0) for b in ledger["open_bets"]
+        b.get("cost", 0) for b in open_bets
         if b.get("token_id") == token_id
     )
+    total_value = funds + sum(b.get("cost", 0) for b in open_bets)
+
+    # Check total new-trade concentration (even without existing position)
+    new_pct = (cost / total_value * 100) if total_value > 0 else 0
+    if new_pct > 20 and existing_cost == 0:
+        if force:
+            messages.append(f"WARNING: Trade is {new_pct:.1f}% of portfolio (20% limit) -- FORCED through")
+        else:
+            messages.append(f"BLOCKED: Trade is {new_pct:.1f}% of portfolio (20% limit). Use --force to override.")
+            ok = False
+
     if existing_cost > 0:
         combined = existing_cost + cost
-        total_value = funds + sum(b.get("cost", 0) for b in ledger["open_bets"])
         pct = (combined / total_value * 100) if total_value > 0 else 0
         messages.append(f"NOTE: Existing position ${existing_cost:.2f}, combined ${combined:.2f} ({pct:.1f}%)")
         if pct > 20:
-            messages.append(f"WARNING: Combined position exceeds 20% limit!")
+            if force:
+                messages.append(f"WARNING: Combined position {pct:.1f}% exceeds 20% limit -- FORCED through")
+            else:
+                messages.append(f"BLOCKED: Combined position {pct:.1f}% exceeds 20% limit. Use --force to override.")
+                ok = False
 
     # Price sanity check
     if price <= 0 or price >= 1:
@@ -81,15 +104,16 @@ def preflight_buy(token_id, price, size, market_name="", side="YES"):
 def execute_buy(token_id, price, size, market_name, side="YES",
                 stop_loss=None, take_profit_1=None, take_profit_2=None,
                 tp1_pct=0.50, tick_size="0.01", neg_risk=False, notes="",
-                dry_run=False):
+                dry_run=False, force=False):
     """Execute a buy order and record it in the ledger atomically.
 
     Returns the ledger bet record on success, None on failure.
+    If force=True, bypasses the 20% concentration block.
     """
     cost = round(price * size, 6)
 
     # Preflight checks
-    ok, messages = preflight_buy(token_id, price, size, market_name, side)
+    ok, messages = preflight_buy(token_id, price, size, market_name, side, force=force)
 
     # Print the pre-trade checklist
     _print_pretrade_checklist(
@@ -105,8 +129,8 @@ def execute_buy(token_id, price, size, market_name, side="YES",
         print(f"\n  DRY RUN -- no order placed.")
         return {"dry_run": True, "cost": cost}
 
-    # Place the order
-    print(f"\n  Placing BUY order: {market_name} ({side}) @ {price} x {size} = ${cost:.2f}")
+    # Place the order (GTC limit order -- sits on book until filled)
+    print(f"\n  Placing BUY order (GTC limit): {market_name} ({side}) @ {price} x {size} = ${cost:.2f}")
     try:
         from proxy_client import buy as proxy_buy
         resp = proxy_buy(
@@ -134,6 +158,7 @@ def execute_buy(token_id, price, size, market_name, side="YES",
         return None
 
     print(f"  ORDER ACCEPTED: {order_id}")
+    print(f"  Order type: GTC (limit) -- will sit on book until filled or cancelled")
 
     # Record in ledger
     try:
@@ -152,8 +177,10 @@ def execute_buy(token_id, price, size, market_name, side="YES",
             neg_risk=neg_risk,
         )
         print(f"  Ledger updated: bet #{bet['id']}")
+        print(f"  NOTE: GTC order -- verify fill on Polymarket. If unfilled, cancel with:")
+        print(f"    python3 -c \"from proxy_client import get_client; get_client(with_auth=True).cancel('{order_id}')\"")
         log_alert(
-            f"BUY: {market_name} ({side}) @ {price} x {size} = ${cost:.2f} [bet #{bet['id']}]",
+            f"BUY (GTC): {market_name} ({side}) @ {price} x {size} = ${cost:.2f} [bet #{bet['id']}] order={order_id[:16]}",
             severity=TRADE, source="execute"
         )
         return bet
@@ -176,28 +203,30 @@ def execute_sell(bet_id, price, size=None, notes="", check_liq=True):
     """
     ledger = _load()
 
-    # Find the bet
-    bet = None
-    for b in ledger["open_bets"]:
-        if b["id"] == bet_id:
-            bet = b
-            break
-
-    if not bet:
-        print(f"  No open bet with ID {bet_id}")
+    # Find the position
+    pos = _find_position(ledger, bet_id)
+    if not pos:
+        print(f"  No open position with ID {bet_id}")
         return None
 
-    token_id = bet["token_id"]
+    if pos["status"] != "OPEN":
+        print(f"  Position #{pos['pos_id']} is {pos['status']}, not OPEN")
+        return None
+
+    token_id = pos["token_id"]
     if not token_id:
-        print(f"  Bet #{bet_id} has no token_id -- cannot sell")
+        print(f"  Position #{pos['pos_id']} has no token_id -- cannot sell")
         return None
 
-    sell_size = size if size is not None else bet["size"]
-    if sell_size > bet["size"]:
-        print(f"  WARNING: Sell size {sell_size} exceeds position {bet['size']}, clamping.")
-        sell_size = bet["size"]
+    bet = {"id": pos["pos_id"], "market": pos["market"], "token_id": token_id,
+           "size": pos["total_shares"], "rules": pos.get("rules", {})}
 
-    rules = bet.get("rules", {})
+    sell_size = size if size is not None else pos["total_shares"]
+    if sell_size > pos["total_shares"]:
+        print(f"  WARNING: Sell size {sell_size} exceeds position {pos['total_shares']}, clamping.")
+        sell_size = pos["total_shares"]
+
+    rules = pos.get("rules", {})
     tick_size = rules.get("tick_size", "0.01")
     neg_risk = rules.get("neg_risk", False)
 
@@ -208,8 +237,8 @@ def execute_sell(bet_id, price, size=None, notes="", check_liq=True):
             print(f"  WARNING: Insufficient liquidity. Depth: {total_depth:.1f} shares, need {sell_size}")
             print(f"  Proceeding anyway -- order may partially fill.")
 
-    # Place the sell order
-    print(f"\n  Placing SELL order: {bet['market'][:50]} @ {price} x {sell_size}")
+    # Place the sell order (GTC limit order -- sits on book until filled)
+    print(f"\n  Placing SELL order (GTC limit): {bet['market'][:50]} @ {price} x {sell_size}")
     try:
         from proxy_client import sell as proxy_sell
         resp = proxy_sell(
@@ -237,13 +266,16 @@ def execute_sell(bet_id, price, size=None, notes="", check_liq=True):
         return None
 
     print(f"  ORDER ACCEPTED: {order_id}")
+    print(f"  Order type: GTC (limit) -- will sit on book until filled or cancelled")
 
     # Record in ledger
     try:
         sell_rec = record_sell(bet_id, price, sell_size, notes=notes)
         print(f"  Ledger updated.")
+        print(f"  NOTE: GTC order -- verify fill on Polymarket. If unfilled, cancel with:")
+        print(f"    python3 -c \"from proxy_client import get_client; get_client(with_auth=True).cancel('{order_id}')\"")
         log_alert(
-            f"SELL: {bet['market'][:50]} @ {price} x {sell_size} [bet #{bet_id}]",
+            f"SELL (GTC): {bet['market'][:50]} @ {price} x {sell_size} [bet #{bet_id}] order={order_id[:16]}",
             severity=TRADE, source="execute"
         )
         return sell_rec
@@ -275,38 +307,37 @@ def adjust_partial_fill(bet_id, actual_filled_size, notes=""):
     """
     ledger = _load()
 
-    # Find the sell trade for this bet
-    sell_trade = None
-    for t in ledger["trades"]:
-        if t.get("action") == "SELL" and t.get("original_bet_id") == bet_id:
-            sell_trade = t
-            # Use the last sell trade for this bet (in case of multiple)
+    # Find the sell event for this position
+    sell_event = None
+    for e in ledger["events"]:
+        if e.get("type") == "SELL" and (e.get("pos_id") == bet_id or e.get("original_bet_id") == bet_id):
+            sell_event = e  # Use last sell for this position
 
-    if not sell_trade:
-        print(f"  No sell trade found for bet #{bet_id}")
+    if not sell_event:
+        print(f"  No sell event found for position #{bet_id}")
         return None
 
-    original_sell_size = sell_trade["size"]
+    original_sell_size = sell_event["size"]
     if actual_filled_size >= original_sell_size:
         print(f"  Actual fill ({actual_filled_size}) >= recorded sell ({original_sell_size}). No adjustment needed.")
         return None
 
     unfilled = round(original_sell_size - actual_filled_size, 6)
-    sell_price = sell_trade["sell_price"]
-    buy_price = sell_trade["buy_price"]
+    sell_price = sell_event["sell_price"]
+    buy_price = sell_event["buy_price"]
 
-    # Correct the sell trade record
-    old_revenue = sell_trade["revenue"]
-    old_pnl = sell_trade["pnl"]
+    # Correct the sell event
+    old_revenue = sell_event["revenue"]
+    old_pnl = sell_event["pnl"]
     new_revenue = round(sell_price * actual_filled_size, 6)
     new_pnl = round(new_revenue - buy_price * actual_filled_size, 6)
 
-    sell_trade["size"] = actual_filled_size
-    sell_trade["revenue"] = new_revenue
-    sell_trade["pnl"] = new_pnl
-    sell_trade["notes"] = (sell_trade.get("notes", "") + f" [ADJUSTED: partial fill, {unfilled} shares unfilled]").strip()
+    sell_event["size"] = actual_filled_size
+    sell_event["revenue"] = new_revenue
+    sell_event["pnl"] = new_pnl
+    sell_event["notes"] = (sell_event.get("notes", "") + f" [ADJUSTED: partial fill, {unfilled} shares unfilled]").strip()
 
-    # Correct funds: we received less revenue than recorded
+    # Correct funds
     revenue_diff = round(old_revenue - new_revenue, 6)
     ledger["funds"] = round(ledger["funds"] - revenue_diff, 6)
 
@@ -314,31 +345,13 @@ def adjust_partial_fill(bet_id, actual_filled_size, notes=""):
     pnl_diff = round(old_pnl - new_pnl, 6)
     ledger["pnl_total"] = round(ledger["pnl_total"] - pnl_diff, 6)
 
-    # Find the original bet -- it may be in closed_bets if it was a full sell
-    original_bet = None
-    for b in ledger["closed_bets"]:
-        if b["id"] == bet_id:
-            original_bet = b
-            break
-
-    if original_bet:
-        # Reopen it with unfilled shares
-        ledger["closed_bets"] = [b for b in ledger["closed_bets"] if b["id"] != bet_id]
-        original_bet["status"] = "OPEN"
-        original_bet["size"] = unfilled
-        cost_per_share = original_bet.get("cost", 0) / original_sell_size if original_sell_size > 0 else buy_price
-        original_bet["cost"] = round(cost_per_share * unfilled, 6)
-        # Correct any accumulated pnl on the bet itself
-        if "pnl" in original_bet:
-            original_bet["pnl"] = round(original_bet.get("pnl", 0) - pnl_diff, 6)
-        ledger["open_bets"].append(original_bet)
-    else:
-        # Bet is already in open_bets (was a partial sell originally) -- add back unfilled
-        for b in ledger["open_bets"]:
-            if b["id"] == bet_id:
-                b["size"] = round(b["size"] + unfilled, 6)
-                b["cost"] = round(b["cost"] + buy_price * unfilled, 6)
-                break
+    # Reopen the position with unfilled shares
+    pos = _find_position(ledger, bet_id)
+    if pos:
+        pos["status"] = "OPEN"
+        pos["total_shares"] = round(pos["total_shares"] + unfilled, 6)
+        pos["total_cost"] = round(pos["avg_price"] * pos["total_shares"], 6)
+        pos["realized_pnl"] = round(pos.get("realized_pnl", 0) - pnl_diff, 6)
 
     _save(ledger)
 
@@ -439,7 +452,7 @@ def _print_pretrade_checklist(token_id, price, size, market_name, side,
 
 def _parse_buy_args(args):
     """Parse CLI arguments for a buy command."""
-    if len(args) < 6:
+    if len(args) < 5:
         print("Usage: python3 execute.py buy <token_id> <price> <size> <market_name> <side> [options]")
         print("\nOptions:")
         print("  --stop <price>      Stop-loss price")
@@ -448,6 +461,7 @@ def _parse_buy_args(args):
         print("  --tp1-pct <float>   Fraction to sell at TP1 (default: 0.50)")
         print("  --tick <size>       Tick size (default: 0.01)")
         print("  --neg-risk          Enable neg-risk mode")
+        print("  --force             Override 20% concentration block")
         print("  --notes <text>      Trade notes")
         return None
 
@@ -464,6 +478,7 @@ def _parse_buy_args(args):
         "tick_size": "0.01",
         "neg_risk": False,
         "notes": "",
+        "force": False,
     }
 
     i = 5
@@ -486,6 +501,9 @@ def _parse_buy_args(args):
         elif args[i] == "--neg-risk":
             result["neg_risk"] = True
             i += 1
+        elif args[i] == "--force":
+            result["force"] = True
+            i += 1
         elif args[i] == "--notes" and i + 1 < len(args):
             result["notes"] = args[i + 1]
             i += 2
@@ -503,6 +521,11 @@ if __name__ == "__main__":
         print("  python3 execute.py adjust <bet_id> <actual_filled_size> [notes]  # Fix partial fill")
         print("  python3 execute.py resolve <bet_id> <won|lost> [notes]")
         print("  python3 execute.py dry-buy <token_id> <price> <size> <market_name> <side>")
+        print("  python3 execute.py place-limits [bet_id]    # Place GTC TP sell orders")
+        print("  python3 execute.py limit-status              # Show active limit orders")
+        print("  python3 execute.py limit-sync                # Detect filled TP orders")
+        print("  python3 execute.py limit-cancel [bet_id]     # Cancel TP limit orders")
+        print("  python3 execute.py limit-replace <bet_id>    # Re-place after level change")
         print("\nRun 'python3 execute.py buy' for full buy options.")
         sys.exit(1)
 
@@ -548,6 +571,32 @@ if __name__ == "__main__":
         won = sys.argv[3].lower() in ("won", "yes", "true", "1")
         notes = " ".join(sys.argv[4:]) if len(sys.argv) > 4 else ""
         record_resolution(bet_id, won, notes)
+
+    elif cmd == "place-limits":
+        from limit_orders import place_all
+        bet_id = int(sys.argv[2]) if len(sys.argv) > 2 else None
+        place_all(bet_id_filter=bet_id)
+
+    elif cmd == "limit-status":
+        from limit_orders import show_status
+        show_status()
+
+    elif cmd == "limit-sync":
+        from limit_orders import sync_with_exchange, cleanup_stale
+        cleanup_stale()
+        sync_with_exchange()
+
+    elif cmd == "limit-cancel":
+        from limit_orders import cancel_orders
+        bet_id = int(sys.argv[2]) if len(sys.argv) > 2 else None
+        cancel_orders(bet_id_filter=bet_id)
+
+    elif cmd == "limit-replace":
+        if len(sys.argv) < 3:
+            print("Usage: python3 execute.py limit-replace <bet_id>")
+            sys.exit(1)
+        from limit_orders import replace_orders
+        replace_orders(int(sys.argv[2]))
 
     else:
         print(f"Unknown command: {cmd}")

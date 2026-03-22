@@ -153,12 +153,79 @@ def scan_feeds(max_age_hours=2):
     return unique
 
 
+OIL_THRESHOLDS = [99, 100, 101, 105]
+_OIL_ALERT_STATE_FILE = os.path.join(BASE_DIR, "oil_alert_state.json")
+
+
+def _load_oil_state():
+    if os.path.exists(_OIL_ALERT_STATE_FILE):
+        with open(_OIL_ALERT_STATE_FILE) as f:
+            return json.load(f)
+    return {"last_alerted": {}}
+
+
+def _save_oil_state(state):
+    with open(_OIL_ALERT_STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def check_oil_thresholds():
+    """Check if WTI oil price has crossed key threshold levels.
+    Returns list of threshold alerts. Only alerts once per threshold crossing.
+    """
+    try:
+        from intel import get_oil_price
+        from alerts import alert as log_alert, CRITICAL
+    except ImportError:
+        return []
+
+    oil = get_oil_price()
+    if not isinstance(oil, dict) or not oil.get("price"):
+        return []
+
+    price = oil["price"]
+    state = _load_oil_state()
+    last_alerted = state.get("last_alerted", {})
+    alerts = []
+
+    for level in OIL_THRESHOLDS:
+        level_key = str(level)
+        prev_alert = last_alerted.get(level_key)
+
+        if price >= level and prev_alert != "above":
+            msg = f"OIL THRESHOLD: WTI crossed above ${level} (now ${price:.2f})"
+            alerts.append({"level": level, "direction": "above", "price": price, "message": msg})
+            log_alert(msg, severity=CRITICAL, source="oil_monitor")
+            last_alerted[level_key] = "above"
+        elif price < level and prev_alert == "above":
+            msg = f"OIL THRESHOLD: WTI dropped below ${level} (now ${price:.2f})"
+            alerts.append({"level": level, "direction": "below", "price": price, "message": msg})
+            log_alert(msg, severity=CRITICAL, source="oil_monitor")
+            last_alerted[level_key] = "below"
+
+    if alerts:
+        state["last_alerted"] = last_alerted
+        state["last_price"] = price
+        state["last_check"] = datetime.now(timezone.utc).isoformat()
+        _save_oil_state(state)
+
+    return alerts
+
+
 def check_and_alert(max_age_hours=2):
     """Run a check and print formatted alerts. Returns alerts list."""
     now = datetime.now(timezone.utc)
     print(f"NEWS MONITOR -- {now.strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"Scanning {len(FEEDS)} feeds for {len(ALERT_RULES)} keyword categories...")
     print("=" * 60)
+
+    # Check oil price thresholds
+    oil_alerts = check_oil_thresholds()
+    if oil_alerts:
+        print(f"\n*** OIL PRICE ALERTS ***")
+        for oa in oil_alerts:
+            print(f"  {oa['message']}")
+        print()
 
     alerts = scan_feeds(max_age_hours=max_age_hours)
 
@@ -259,6 +326,11 @@ def run_loop(interval_minutes=15):
                     print(f"\n*** {high_count} HIGH URGENCY ALERTS -- CHECK POSITIONS ***\n")
         except Exception as e:
             print(f"  Monitor error: {e}")
+            try:
+                from alerts import alert as log_alert, WARNING
+                log_alert(f"News monitor error: {e}", severity=WARNING, source="news_monitor")
+            except Exception:
+                pass  # Don't let alert logging kill the monitor
 
         print(f"\nNext check in {interval_minutes} minutes...")
         time.sleep(interval_minutes * 60)

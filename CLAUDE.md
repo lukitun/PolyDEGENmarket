@@ -42,7 +42,15 @@ Oversees the entire operation. Reviews performance, plans ahead, coordinates pri
 - Catches portfolio drift, strategy decay, and missed connections
 - Defined in `.claude/agents/supervisor.md`
 
-**Typical session:** spawn `@supervisor` first (it plans and prioritizes), then spawn `@trader` (it executes the plan), use `@researcher` for deep dives on specific markets before trading, then `@dev` in the background (it builds what the supervisor prioritized).
+### `@swing-scanner` -- Insider/Smart Money Detection Agent
+Finds markets with large price swings that have no obvious news catalyst.
+- Runs swing_scanner.py to detect suspicious movers
+- Investigates each one: checks resolution rules, researches topic, checks price history
+- Classifies as INSIDER SIGNAL, WHALE MOVE, ALGO ARTIFACT, DELAYED NEWS, or UNCLEAR
+- Produces actionable trade recommendations with stop losses
+- Defined in `.claude/agents/swing_scanner.md`
+
+**Typical session:** spawn `@supervisor` first (it plans and prioritizes), then spawn `@trader` (it executes the plan), use `@researcher` for deep dives on specific markets before trading, use `@swing-scanner` to hunt for insider/smart money signals, then `@dev` in the background (it builds what the supervisor prioritized).
 
 ## Risk Rules (MANDATORY -- NEVER BREAK THESE)
 1. **Never bet more than 20% of total funds on a single position**
@@ -81,13 +89,19 @@ Every session should follow this order:
 
 ## Tools Available
 ```
-python3 ledger.py status          # Portfolio overview (includes on-chain balance check)
+python3 ledger.py status          # Portfolio overview (positions consolidated by token)
 python3 ledger.py sync            # Sync ledger with on-chain USDC balance
-python3 ledger.py history         # Trade history
-python3 ledger.py max-bet         # Max allowed bet
+python3 ledger.py history         # Event history
+python3 ledger.py max-bet         # Max allowed bet (20% of total portfolio value)
+python3 ledger.py analytics       # Win rate, PnL, hold time by strategy
+python3 ledger.py rebuild         # Rebuild positions from event log (fixes drift)
+python3 ledger.py reconcile       # Verify ledger matches on-chain positions
 python3 arbitrage.py [pages]      # Arbitrage scanner (default: all ~9000 events)
 python3 volatility.py [pages]     # Volatility scanner
 python3 volatility.py deep <id>   # Deep vol analysis on a token
+python3 swing_scanner.py          # Detect unexplained price swings (insider/smart money)
+python3 swing_scanner.py deep     # Deep swing scan (more markets, lower thresholds)
+python3 swing_scanner.py <keyword> # Swing scan filtered by keyword
 python3 markets.py search <q>     # Search markets by keyword (scans top events)
 python3 markets.py trending       # Top markets by volume with prices + token IDs
 python3 markets.py event <slug>   # Lookup event by slug (from URL)
@@ -122,12 +136,19 @@ python3 equity.py snapshot        # Record portfolio value (book value)
 python3 equity.py live            # Record with live market prices
 python3 equity.py chart           # ASCII equity chart
 python3 kelly.py <prob> <price>   # Kelly criterion sizing
-python3 execute.py buy <token> <price> <size> <name> <side> [--stop X --tp1 X --tp2 X]
+python3 execute.py buy <token> <price> <size> <name> <side> [--stop X --tp1 X --tp2 X --force]
 python3 execute.py sell <bet_id> <price> [size]  # Unified sell (order + ledger)
 python3 execute.py adjust <bet_id> <actual_size> # Fix partial fill (reopen unfilled shares)
 python3 execute.py dry-buy ...    # Dry run (no order placed, just checks)
 python3 execute.py resolve <bet_id> <won|lost>   # Record resolution
-python3 resolution.py             # Bond play candidates (90-98c markets)
+python3 execute.py place-limits [bet_id]         # Place GTC TP sell orders on exchange
+python3 execute.py limit-status                  # Show active limit orders
+python3 execute.py limit-sync                    # Detect filled TP orders, update ledger
+python3 execute.py limit-cancel [bet_id]         # Cancel TP limit orders
+python3 execute.py limit-replace <bet_id>        # Cancel + re-place after level change
+python3 limit_orders.py dry [bet_id]             # Dry run (show what would be placed)
+python3 resolution.py             # Bond play candidates (wide search, 90-98c)
+python3 resolution.py quick [days] # Quick bonds: 90c+, 14 days, high liq (best for trading)
 python3 resolution.py expiring [days]  # Markets expiring within N days
 python3 resolution.py check       # Check our positions for upcoming resolutions
 python3 improve.py                # Codebase audit (security, integrity, code quality)

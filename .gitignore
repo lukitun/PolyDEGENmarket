@@ -6,11 +6,17 @@ alerts.log
 
 # Personal data
 ledger.json
+ledger.json.tmp
+ledger.json.v1.backup
 monitor_state.json
+monitor_state.json.tmp
+limit_orders.json
+limit_orders.json.tmp
 monitor.log
 watchlist.json
 equity_history.json
 news_alerts.json
+oil_alert_state.json
 
 # Google Drive (optional, not part of public tool)
 gdrive.py

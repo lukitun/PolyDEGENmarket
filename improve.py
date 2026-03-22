@@ -29,9 +29,11 @@ SENSITIVE_PATTERNS = [
 ]
 
 SENSITIVE_FILES = [
-    ".env", "ledger.json", "credentials.json", "gdrive_token.json",
-    "gdrive_folder_id.txt", "monitor.log", "monitor_state.json",
-    "watchlist.json", "equity_history.json", "news_alerts.json",
+    ".env", "ledger.json", "ledger.json.tmp", "credentials.json",
+    "gdrive_token.json", "gdrive_folder_id.txt", "monitor.log",
+    "monitor_state.json", "watchlist.json", "equity_history.json",
+    "news_alerts.json", "oil_alert_state.json", "alerts.log",
+    "limit_orders.json",
 ]
 
 
@@ -94,6 +96,15 @@ def check_security():
 def check_ledger_integrity():
     """Verify ledger data is consistent."""
     issues = []
+
+    # Check for stale temp file (indicates a failed atomic write)
+    tmp_file = LEDGER_FILE + ".tmp"
+    if os.path.exists(tmp_file):
+        issues.append(
+            "CRITICAL: ledger.json.tmp exists -- a previous save may have failed! "
+            "Check if ledger.json is intact, then delete the .tmp file."
+        )
+
     ledger = load_ledger()
     if not ledger:
         issues.append("WARNING: No ledger.json found")
@@ -102,8 +113,25 @@ def check_ledger_integrity():
     funds = ledger.get("funds", 0)
     initial = ledger.get("initial_deposit", 0)
     pnl = ledger.get("pnl_total", 0)
-    open_bets = ledger.get("open_bets", [])
-    closed_bets = ledger.get("closed_bets", [])
+
+    # Support both v1 and v2 ledger formats
+    if ledger.get("version") == 2:
+        positions = ledger.get("positions", {})
+        open_bets = [
+            {"id": p["pos_id"], "market": p["market"], "size": p["total_shares"],
+             "cost": p["total_cost"], "token_id": p["token_id"],
+             "rules": p.get("rules"), "timestamp": p.get("first_entry", ""),
+             "status": p["status"]}
+            for p in positions.values() if p["status"] == "OPEN"
+        ]
+        closed_bets = [
+            {"id": p["pos_id"], "market": p["market"], "pnl": p.get("realized_pnl"),
+             "status": p["status"]}
+            for p in positions.values() if p["status"] != "OPEN"
+        ]
+    else:
+        open_bets = ledger.get("open_bets", [])
+        closed_bets = ledger.get("closed_bets", [])
 
     # Float precision check
     funds_str = str(funds)
@@ -114,31 +142,32 @@ def check_ledger_integrity():
     if funds < -0.001:
         issues.append(f"CRITICAL: Negative funds: ${funds:.6f} -- ledger is corrupted")
 
-    # Negative or zero size check on open bets
+    # Negative or zero size check on open positions
     for bet in open_bets:
         size = bet.get("size", 0)
         if size <= 0:
-            issues.append(f"CRITICAL: Bet #{bet.get('id')} has non-positive size ({size}) -- should be closed")
+            issues.append(f"CRITICAL: Position #{bet.get('id')} has non-positive size ({size}) -- should be closed")
         cost = bet.get("cost", 0)
         if cost < 0:
-            issues.append(f"CRITICAL: Bet #{bet.get('id')} has negative cost (${cost}) -- ledger corrupted")
+            issues.append(f"CRITICAL: Position #{bet.get('id')} has negative cost (${cost}) -- ledger corrupted")
 
     # Position sizing check (20% rule)
+    total_value = funds + sum(b.get("cost", 0) for b in open_bets)
     for bet in open_bets:
         cost = bet.get("cost", 0)
-        pct = (cost / initial * 100) if initial > 0 else 0
+        pct = (cost / total_value * 100) if total_value > 0 else 0
         if pct > 22:  # 2% tolerance for price movement
-            issues.append(f"RISK: Bet #{bet.get('id')} '{bet.get('market', '')[:40]}' is {pct:.1f}% of initial deposit (limit: 20%)")
+            issues.append(f"RISK: Position #{bet.get('id')} '{bet.get('market', '')[:40]}' is {pct:.1f}% of portfolio (limit: 20%)")
 
-    # Check for bets without token_id (can't monitor or sell)
+    # Check for positions without token_id (can't monitor or sell)
     for bet in open_bets:
         if not bet.get("token_id"):
-            issues.append(f"WARNING: Bet #{bet.get('id')} has no token_id -- cannot monitor or sell")
+            issues.append(f"WARNING: Position #{bet.get('id')} has no token_id -- cannot monitor or sell")
 
-    # Check for bets without rules (no stop-loss protection)
+    # Check for positions without rules (no stop-loss protection)
     for bet in open_bets:
         if not bet.get("rules"):
-            issues.append(f"WARNING: Bet #{bet.get('id')} '{bet.get('market', '')[:40]}' has no monitor rules set")
+            issues.append(f"WARNING: Position #{bet.get('id')} '{bet.get('market', '')[:40]}' has no monitor rules set")
 
     # Check for stale positions (no activity in 30+ days)
     now = datetime.now(timezone.utc)
@@ -149,11 +178,11 @@ def check_ledger_integrity():
                 bet_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
                 age_days = (now - bet_time).days
                 if age_days > 30:
-                    issues.append(f"INFO: Bet #{bet.get('id')} '{bet.get('market', '')[:40]}' is {age_days} days old -- review if still valid")
+                    issues.append(f"INFO: Position #{bet.get('id')} '{bet.get('market', '')[:40]}' is {age_days} days old -- review if still valid")
             except (ValueError, TypeError):
                 pass
 
-    # Check closed bets have PnL recorded
+    # Check closed positions have PnL recorded
     for bet in closed_bets:
         if bet.get("pnl") is None and bet.get("status") in ("CLOSED", "WON", "LOST"):
             # Check if PnL exists in trade history
@@ -282,12 +311,16 @@ def check_code_quality():
             if argv_match and _is_inside_main_guard(lines, i - 1):
                 idx = int(argv_match.group(1))
                 if idx >= 2:
-                    # Check if there's a length guard in the preceding 15 lines
-                    preceding = "".join(lines[max(0, i-16):i-1])
-                    if f'len(sys.argv)' not in preceding and f'sys.argv) <' not in preceding:
-                        issues.append(
-                            f"CODE: {pyfile}:{i} -- sys.argv[{idx}] accessed without bounds check (IndexError risk)"
-                        )
+                    # Check same line first (ternary guards like: x if len(sys.argv) > 2 else None)
+                    if f'len(sys.argv)' in line:
+                        pass  # Guarded on same line
+                    else:
+                        # Check if there's a length guard in the preceding 15 lines
+                        preceding = "".join(lines[max(0, i-16):i-1])
+                        if f'len(sys.argv)' not in preceding and f'sys.argv) <' not in preceding:
+                            issues.append(
+                                f"CODE: {pyfile}:{i} -- sys.argv[{idx}] accessed without bounds check (IndexError risk)"
+                            )
 
     return issues
 
@@ -299,12 +332,21 @@ def check_reconciliation():
     if not ledger:
         return ["Cannot reconcile: no ledger.json"]
 
-    # Check that all open bets have required fields
-    for bet in ledger.get("open_bets", []):
-        required = ["id", "market", "side", "price", "size", "cost", "token_id"]
-        missing = [f for f in required if not bet.get(f)]
-        if missing:
-            issues.append(f"DATA: Bet #{bet.get('id', '?')} missing fields: {missing}")
+    # Check that all open positions have required fields
+    if ledger.get("version") == 2:
+        for pos in ledger.get("positions", {}).values():
+            if pos.get("status") != "OPEN":
+                continue
+            required = ["pos_id", "market", "side", "total_shares", "total_cost", "token_id"]
+            missing = [f for f in required if not pos.get(f)]
+            if missing:
+                issues.append(f"DATA: Position #{pos.get('pos_id', '?')} missing fields: {missing}")
+    else:
+        for bet in ledger.get("open_bets", []):
+            required = ["id", "market", "side", "price", "size", "cost", "token_id"]
+            missing = [f for f in required if not bet.get(f)]
+            if missing:
+                issues.append(f"DATA: Bet #{bet.get('id', '?')} missing fields: {missing}")
 
     # Try to check on-chain USDC balance
     try:
@@ -340,10 +382,16 @@ def check_reconciliation():
         resp.raise_for_status()
         on_chain_positions = resp.json()
 
-        ledger_tokens = set(
-            b.get("token_id", "") for b in ledger.get("open_bets", [])
-            if b.get("token_id")
-        )
+        if ledger.get("version") == 2:
+            ledger_tokens = set(
+                p.get("token_id", "") for p in ledger.get("positions", {}).values()
+                if p.get("status") == "OPEN" and p.get("token_id")
+            )
+        else:
+            ledger_tokens = set(
+                b.get("token_id", "") for b in ledger.get("open_bets", [])
+                if b.get("token_id")
+            )
 
         on_chain_tokens = set()
         for p in on_chain_positions:
@@ -355,11 +403,18 @@ def check_reconciliation():
         # Positions in ledger but not on-chain
         ledger_only = ledger_tokens - on_chain_tokens
         for tid in ledger_only:
-            bet_names = [
-                b.get("market", "?")[:40]
-                for b in ledger.get("open_bets", [])
-                if b.get("token_id") == tid
-            ]
+            if ledger.get("version") == 2:
+                bet_names = [
+                    p.get("market", "?")[:40]
+                    for p in ledger.get("positions", {}).values()
+                    if p.get("token_id") == tid and p.get("status") == "OPEN"
+                ]
+            else:
+                bet_names = [
+                    b.get("market", "?")[:40]
+                    for b in ledger.get("open_bets", [])
+                    if b.get("token_id") == tid
+                ]
             issues.append(
                 f"WARNING: Ledger has position not found on-chain: {', '.join(bet_names)} "
                 f"(token: {tid[:16]}...)"
@@ -400,9 +455,13 @@ def check_plays():
     play_files = [f for f in os.listdir(plays_dir) if f.endswith(".md") and f != "example_play.md"]
 
     open_markets = set()
-    for bet in ledger.get("open_bets", []):
-        market = bet.get("market", "")
-        open_markets.add(market)
+    if ledger.get("version") == 2:
+        for p in ledger.get("positions", {}).values():
+            if p.get("status") == "OPEN":
+                open_markets.add(p.get("market", ""))
+    else:
+        for bet in ledger.get("open_bets", []):
+            open_markets.add(bet.get("market", ""))
 
     if not play_files and open_markets:
         issues.append(f"WARNING: {len(open_markets)} open bets but no play files in plays/")
@@ -472,9 +531,97 @@ def check_cron_health():
     return issues
 
 
+def check_monitor_health():
+    """Check that the stop-loss monitoring system is correctly configured."""
+    issues = []
+    ledger = load_ledger()
+    if not ledger:
+        return issues
+
+    if ledger.get("version") == 2:
+        open_bets = [
+            {"id": p["pos_id"], "market": p["market"], "price": p["avg_price"],
+             "size": p["total_shares"], "rules": p.get("rules"), "side": p["side"]}
+            for p in ledger.get("positions", {}).values() if p["status"] == "OPEN"
+        ]
+    else:
+        open_bets = ledger.get("open_bets", [])
+    if not open_bets:
+        return issues
+
+    bets_without_rules = []
+    bets_with_rules = []
+    for bet in open_bets:
+        if bet.get("rules") and bet.get("rules", {}).get("stop_loss") is not None:
+            bets_with_rules.append(bet)
+        else:
+            bets_without_rules.append(bet)
+
+    if bets_without_rules:
+        ids = [b.get("id") for b in bets_without_rules]
+        issues.append(
+            f"WARNING: {len(bets_without_rules)} open bets have no stop-loss rules (IDs: {ids}) "
+            f"-- only emergency 40% stop applies"
+        )
+
+    # Check that stop-loss is below entry price for YES, and makes sense
+    for bet in bets_with_rules:
+        rules = bet["rules"]
+        sl = rules.get("stop_loss")
+        entry = bet.get("price", 0)
+        side = bet.get("side", "YES")
+
+        if sl is not None and entry > 0:
+            if side == "YES" and sl >= entry:
+                issues.append(
+                    f"RISK: Bet #{bet['id']} stop-loss ({sl}) >= entry price ({entry}) -- "
+                    f"stop will trigger immediately!"
+                )
+            elif side == "NO" and sl >= entry:
+                issues.append(
+                    f"RISK: Bet #{bet['id']} (NO side) stop-loss ({sl}) >= entry price ({entry}) -- "
+                    f"stop will trigger immediately!"
+                )
+
+        # Check that tick_size is set (needed for sell orders)
+        if not rules.get("tick_size"):
+            issues.append(
+                f"WARNING: Bet #{bet['id']} has rules but no tick_size set -- sells may fail"
+            )
+
+    # Check that monitor_state.json is not stale (if monitoring is active)
+    state_file = os.path.join(BASE_DIR, "monitor_state.json")
+    if os.path.exists(state_file):
+        try:
+            mtime = os.path.getmtime(state_file)
+            from datetime import datetime, timezone
+            age_hours = (datetime.now(timezone.utc).timestamp() - mtime) / 3600
+            if age_hours > 24 and bets_with_rules:
+                issues.append(
+                    f"INFO: monitor_state.json last modified {age_hours:.0f}h ago -- "
+                    f"is the cron monitor running?"
+                )
+        except OSError:
+            pass
+
+    if bets_with_rules and not issues:
+        issues.append(f"INFO: {len(bets_with_rules)} positions have stop-loss rules active")
+
+    return issues
+
+
 def check_data_files():
     """Check health of data files (watchlist, equity history)."""
     issues = []
+
+    # Check for stale temp files from atomic writes (indicates failed save)
+    for data_file in ["monitor_state.json", "limit_orders.json"]:
+        tmp = os.path.join(BASE_DIR, data_file + ".tmp")
+        if os.path.exists(tmp):
+            issues.append(
+                f"WARNING: {data_file}.tmp exists -- a previous save may have failed. "
+                f"Check if {data_file} is intact, then delete the .tmp file."
+            )
 
     # Check watchlist
     wl_file = os.path.join(BASE_DIR, "watchlist.json")
@@ -527,6 +674,7 @@ def run_audit(mode="full"):
 
     if mode == "full":
         sections.append(("CODE QUALITY", check_code_quality))
+        sections.append(("MONITOR HEALTH", check_monitor_health))
         sections.append(("PROXY HEALTH", check_proxy_health))
         sections.append(("CRON HEALTH", check_cron_health))
         sections.append(("DATA FILES", check_data_files))

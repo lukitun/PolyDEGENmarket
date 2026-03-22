@@ -52,7 +52,14 @@ def take_snapshot(live_prices=None):
     funds = ledger.get("funds", 0)
     initial = ledger.get("initial_deposit", 0)
     pnl_realized = ledger.get("pnl_total", 0)
-    open_bets = ledger.get("open_bets", [])
+    # Support v2 ledger (positions dict) and v1 (open_bets list)
+    if ledger.get("version") == 2:
+        open_bets = [
+            {"token_id": p["token_id"], "size": p["total_shares"], "cost": p["total_cost"]}
+            for p in ledger.get("positions", {}).values() if p["status"] == "OPEN"
+        ]
+    else:
+        open_bets = ledger.get("open_bets", [])
 
     # Calculate open position value
     open_cost = sum(b.get("cost", 0) for b in open_bets)
@@ -115,9 +122,14 @@ def take_live_snapshot():
         print("No ledger.json found.")
         return
 
-    open_bets = ledger.get("open_bets", [])
+    if ledger.get("version") == 2:
+        open_bets = [
+            {"token_id": p["token_id"], "size": p["total_shares"], "cost": p["total_cost"]}
+            for p in ledger.get("positions", {}).values() if p["status"] == "OPEN"
+        ]
+    else:
+        open_bets = ledger.get("open_bets", [])
     if not open_bets:
-        # No open positions, just record book value
         return take_snapshot()
 
     # Fetch live prices

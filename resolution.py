@@ -213,13 +213,12 @@ def scan_bond_candidates(max_days=30, max_pages=8, min_volume=5000,
 def check_our_positions():
     """Check which of our open bets are near resolution."""
     try:
-        from ledger import _load
+        from ledger import get_open_bets
     except ImportError:
         print("Cannot load ledger.")
         return
 
-    ledger = _load()
-    open_bets = ledger.get("open_bets", [])
+    open_bets = get_open_bets()
     if not open_bets:
         print("No open positions.")
         return
@@ -282,6 +281,118 @@ def print_expiring(results):
             print(f"       Token: {r['token_ids'][0][:20]}...")
 
 
+def scan_quick_bonds(max_days=14, min_volume=10000, min_price=0.90, max_price=0.98,
+                      min_liquidity=5000):
+    """Focused bond scan: 90c+ markets expiring in 1-2 weeks with good liquidity.
+
+    This is the optimized scanner for the best bond play candidates.
+    Focuses on the sweet spot: high price, near expiry, sufficient liquidity.
+    Sorted by annualized return (best risk-adjusted deals first).
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now + timedelta(days=max_days)
+    candidates = []
+
+    # Scan more pages since we have strict filters
+    for page in range(12):
+        print(f"  Scanning page {page + 1}...", end=" ", flush=True)
+        try:
+            events = fetch_events_page(offset=page * PAGE_SIZE, limit=PAGE_SIZE)
+        except (httpx.HTTPError, ValueError) as e:
+            print(f"error: {e}")
+            break
+
+        if not events:
+            print("done")
+            break
+
+        count = 0
+        for event in events:
+            for market in event.get("markets", []):
+                prices = parse_prices(market)
+                if not prices or len(prices) < 2:
+                    continue
+
+                volume = market.get("volumeNum", 0) or 0
+                liquidity = market.get("liquidityNum", 0) or 0
+
+                # Strict filters for quality bond plays
+                if volume < min_volume or liquidity < min_liquidity:
+                    continue
+
+                end_date = parse_end_date(market)
+                if not end_date or end_date <= now or end_date > cutoff:
+                    continue
+
+                days_left = (end_date - now).total_seconds() / 86400
+                token_ids = parse_token_ids(market)
+                outcomes = market.get("outcomes", [])
+                if isinstance(outcomes, str):
+                    try:
+                        outcomes = json.loads(outcomes)
+                    except (json.JSONDecodeError, TypeError):
+                        outcomes = ["Yes", "No"]
+
+                # Check both sides for bond-worthy prices
+                for idx, price in enumerate(prices):
+                    if not (min_price <= price <= max_price):
+                        continue
+
+                    side_name = outcomes[idx] if idx < len(outcomes) else ("Yes" if idx == 0 else "No")
+                    token_id = token_ids[idx] if idx < len(token_ids) else ""
+
+                    profit_per_share = 1.0 - price
+                    return_pct = (profit_per_share / price) * 100
+                    annualized = return_pct * (365 / days_left) if days_left > 0 else 0
+
+                    entry = {
+                        "event": event.get("title", ""),
+                        "question": market.get("question", ""),
+                        "side": side_name,
+                        "price": price,
+                        "profit_per_share": round(profit_per_share, 4),
+                        "return_pct": round(return_pct, 2),
+                        "annualized_pct": round(annualized, 1),
+                        "end_date": end_date.strftime("%Y-%m-%d"),
+                        "days_left": round(days_left, 1),
+                        "volume": volume,
+                        "liquidity": liquidity,
+                        "token_id": token_id,
+                        "token_ids": token_ids,
+                    }
+                    candidates.append(entry)
+                    count += 1
+
+        print(f"{count} candidates found")
+        if len(events) < PAGE_SIZE:
+            break
+        time.sleep(0.2)
+
+    # Sort by annualized return (best risk-adjusted deals first)
+    candidates.sort(key=lambda x: x["annualized_pct"] or 0, reverse=True)
+    return candidates
+
+
+def print_quick_bonds(results):
+    """Print quick bond scan results with detailed info."""
+    print("=" * 70)
+    print(f"QUICK BOND CANDIDATES ({len(results)} found)")
+    print(f"  90-98c markets expiring within 14 days, min $10k vol, min $5k liq")
+    print("=" * 70)
+
+    for i, r in enumerate(results[:25], 1):
+        ann_str = f"{r['annualized_pct']:.0f}% ann." if r["annualized_pct"] else "?"
+        print(f"\n  #{i}  {r['question'][:55]} [{r['side'].upper()}]")
+        print(f"       Price: {r['price']:.2f}  |  Return: {r['return_pct']:.1f}% ({ann_str})")
+        print(f"       Ends: {r['end_date']} ({r['days_left']:.0f}d)  |  Vol: ${r['volume']:,.0f}  |  Liq: ${r['liquidity']:,.0f}")
+        if r.get("token_id"):
+            print(f"       Token: {r['token_id'][:20]}...")
+
+    if not results:
+        print("\n  No candidates found matching criteria.")
+        print("  Try: python3 resolution.py bonds  (wider search)")
+
+
 def print_bonds(results):
     """Print bond play candidates."""
     print("=" * 70)
@@ -303,7 +414,13 @@ def print_bonds(results):
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "bonds"
 
-    if cmd == "bonds":
+    if cmd == "quick":
+        # Optimized quick scan: 90c+ within 14 days, good liquidity
+        days = int(sys.argv[2]) if len(sys.argv) > 2 else 14
+        results = scan_quick_bonds(max_days=days)
+        print_quick_bonds(results)
+
+    elif cmd == "bonds":
         results = scan_bond_candidates()
         print_bonds(results)
 
@@ -317,7 +434,8 @@ if __name__ == "__main__":
 
     else:
         print("Usage:")
-        print("  python3 resolution.py                 # Bond play candidates")
-        print("  python3 resolution.py bonds           # Bond play candidates")
+        print("  python3 resolution.py                 # Bond play candidates (wide)")
+        print("  python3 resolution.py quick [days]     # Quick bonds: 90c+, 14 days, high liq")
+        print("  python3 resolution.py bonds           # Bond play candidates (wide)")
         print("  python3 resolution.py expiring [days]  # Markets expiring soon")
         print("  python3 resolution.py check            # Check our positions")
